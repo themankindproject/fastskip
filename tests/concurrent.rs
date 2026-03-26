@@ -5,7 +5,7 @@ use fastskip::ConcurrentSkipList;
 
 #[test]
 fn test_4_writer_threads_1k_each() {
-    let mt = Arc::new(ConcurrentSkipList::new());
+    let mt = Arc::new(ConcurrentSkipList::with_shards(8));
     let mut handles = vec![];
 
     for tid in 0..4 {
@@ -114,7 +114,7 @@ fn test_concurrent_insert_and_read() {
 
 #[test]
 fn test_no_data_races() {
-    let mt = Arc::new(ConcurrentSkipList::new());
+    let mt = Arc::new(ConcurrentSkipList::with_shards(8));
     let mut handles = vec![];
 
     // Writers with overlapping key ranges (stress test CAS)
