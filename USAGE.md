@@ -447,7 +447,7 @@ Arena memory is bulk-allocated in blocks and bulk-reclaimed when the memtable is
 
 ## Changelog
 
-### v0.1.0
+### v0.1.0 (unreleased)
 
 - Initial release
 - Lock-free skip list with per-thread arena shards
@@ -455,14 +455,10 @@ Arena memory is bulk-allocated in blocks and bulk-reclaimed when the memtable is
 - Tombstone delete support
 - Seal/freeze lifecycle for LSM memtables
 - Range cursors for prefix scans
-
-### v0.1.1
-
-- Added memory utilization metrics:
+- Memory utilization metrics:
   - `memory_reserved()` — total arena capacity
   - `memory_utilization()` — fraction used (0.0-1.0)
   - `memory_idle()` — unused bytes
-- Updated documentation
 
 ---
 

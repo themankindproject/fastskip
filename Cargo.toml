@@ -1,6 +1,6 @@
 [package]
 name = "fastskip"
-version = "0.1.1"
+version = "0.1.0"
 edition = "2021"
 authors = ["Ashutosh Kumar <kumarashutosh34169@gmail.com>"]
 description = "Lock-free arena-backed skip list memtable for LSM-tree storage engines"
