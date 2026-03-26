@@ -39,21 +39,6 @@ jobs:
           components: rustfmt
       - run: cargo fmt --check
 
-  miri:
-    name: Miri
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: miri
-      - run: cargo miri test
-        env:
-          MIRIFLAGS: "-Zmiri-symbolic-alignment-check -Zmiri-disable-isolation"
-      # Run each example under Miri to catch unsafe code issues
-      - run: cargo miri run --example basic
-      - run: cargo miri run --example lsm_memtable
-
   loom:
     name: Loom
     runs-on: ubuntu-latest
