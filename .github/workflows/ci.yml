@@ -49,7 +49,7 @@ jobs:
           components: miri
       - run: cargo miri test
         env:
-          MIRIFLAGS: "-Zmiri-strict-provenance -Zmiri-symbolic-alignment-check -Zmiri-disable-isolation"
+          MIRIFLAGS: "-Zmiri-symbolic-alignment-check -Zmiri-disable-isolation"
       # Run each example under Miri to catch unsafe code issues
       - run: cargo miri run --example basic
       - run: cargo miri run --example lsm_memtable

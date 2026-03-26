@@ -39,7 +39,7 @@ fn test_16_writers_5k_each() {
 
 #[test]
 fn test_concurrent_insert_delete_read() {
-    let sl = Arc::new(ConcurrentSkipList::new());
+    let sl = Arc::new(ConcurrentSkipList::with_shards(8));
 
     // Pre-populate
     for i in 0..500 {
