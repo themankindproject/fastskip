@@ -466,6 +466,21 @@ impl ConcurrentSkipList {
         self.arena.stats().bytes_allocated
     }
 
+    /// Total arena bytes reserved across all shards.
+    pub fn memory_reserved(&self) -> usize {
+        self.arena.stats().bytes_reserved
+    }
+
+    /// Returns utilization as a fraction (0.0 to 1.0).
+    pub fn memory_utilization(&self) -> f64 {
+        self.arena.stats().utilization()
+    }
+
+    /// Bytes not currently in use (reserved - allocated).
+    pub fn memory_idle(&self) -> usize {
+        self.arena.stats().bytes_idle()
+    }
+
     // ─── Lifecycle ─────────────────────────────────────────────────────────
 
     /// Seal this memtable and create a fresh one for new writes.
@@ -608,6 +623,21 @@ impl FrozenMemtable {
     /// Total arena bytes allocated.
     pub fn memory_usage(&self) -> usize {
         self.inner.memory_usage()
+    }
+
+    /// Total arena bytes reserved.
+    pub fn memory_reserved(&self) -> usize {
+        self.inner.memory_reserved()
+    }
+
+    /// Returns utilization as a fraction (0.0 to 1.0).
+    pub fn memory_utilization(&self) -> f64 {
+        self.inner.memory_utilization()
+    }
+
+    /// Bytes not currently in use.
+    pub fn memory_idle(&self) -> usize {
+        self.inner.memory_idle()
     }
 
     /// Point lookup. Returns `(value, is_tombstone)`.
@@ -773,6 +803,25 @@ mod tests {
             sl.insert(k.as_bytes(), v.as_bytes());
         }
         assert!(sl.memory_usage() > before);
+    }
+
+    #[test]
+    fn test_memory_stats() {
+        let sl = ConcurrentSkipList::new();
+        sl.insert(b"key1", b"value1");
+
+        let reserved = sl.memory_reserved();
+        let utilization = sl.memory_utilization();
+        let idle = sl.memory_idle();
+
+        assert!(reserved > 0);
+        assert!(utilization > 0.0 && utilization <= 1.0);
+        assert_eq!(reserved - sl.memory_usage(), idle);
+
+        // FrozenMemtable also exposes these
+        let (frozen, _) = sl.seal().unwrap();
+        assert!(frozen.memory_reserved() > 0);
+        assert!(frozen.memory_utilization() > 0.0);
     }
 
     #[test]
