@@ -160,11 +160,25 @@ use crate::node::*;
 use crate::skiplist::{InsertResult, SkipList};
 
 pub use crate::iter::{Cursor, Entry, Iter, Snapshot, SnapshotIter};
-pub use fastarena;
 
 // ─── Error types ──────────────────────────────────────────────────────────────
 
 /// Error returned by [`ConcurrentSkipList::try_insert`].
+///
+/// # Example
+///
+/// ```rust
+/// use fastskip::{ConcurrentSkipList, InsertError};
+///
+/// let sl = ConcurrentSkipList::new();
+/// sl.insert(b"key", b"val");
+///
+/// // Duplicate key
+/// assert_eq!(sl.try_insert(b"key", b"val2"), Err(InsertError::DuplicateKey));
+///
+/// // Success
+/// assert!(sl.try_insert(b"new", b"val").is_ok());
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsertError {
     /// The key already exists in the skip list.
@@ -185,6 +199,23 @@ impl std::fmt::Display for InsertError {
 impl std::error::Error for InsertError {}
 
 /// Error for batch operations.
+///
+/// # Example
+///
+/// ```rust
+/// use fastskip::{ConcurrentSkipList, BatchError};
+///
+/// let sl = ConcurrentSkipList::new();
+/// sl.insert(b"a", b"1");
+///
+/// let batch: &[(&[u8], &[u8])] = &[(b"a", b"x"), (b"b", b"2")];
+/// match sl.insert_batch(batch) {
+///     Err(BatchError::PartialFailure { succeeded, failed }) => {
+///         assert_eq!(succeeded, 1);
+///     }
+///     _ => unreachable!(),
+/// }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchError {
     /// Some inserts failed.
@@ -208,6 +239,10 @@ impl std::fmt::Display for BatchError {
 impl std::error::Error for BatchError {}
 
 /// Error returned by [`ConcurrentSkipList::seal`].
+///
+/// This error cannot occur in practice because `seal()` consumes `self`
+/// and [`FrozenMemtable`] does not expose a `seal()` method. It exists
+/// as a defensive measure and for forward compatibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SealError {
     /// The memtable is already sealed.
@@ -277,16 +312,47 @@ unsafe impl Sync for ConcurrentSkipList {}
 
 impl ConcurrentSkipList {
     /// Create a new skip list with default shard count.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// sl.insert(b"key", b"value");
+    /// assert_eq!(sl.get_live(b"key"), Some(b"value".as_slice()));
+    /// ```
     pub fn new() -> Self {
         Self::with_shards(num_cpus())
     }
 
     /// Create with a given initial arena capacity per shard.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// // 1MB initial arena per shard
+    /// let sl = ConcurrentSkipList::with_capacity(1024 * 1024);
+    /// ```
     pub fn with_capacity(arena_bytes: usize) -> Self {
         Self::with_capacity_and_shards(arena_bytes, num_cpus(), 0, 0)
     }
 
     /// Create with a specific number of arena shards.
+    ///
+    /// Each writer thread gets a unique shard. Shard count should match
+    /// the expected number of concurrent writer threads.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// // 4 shards for 4 writer threads
+    /// let sl = ConcurrentSkipList::with_shards(4);
+    /// ```
     pub fn with_shards(num_shards: usize) -> Self {
         Self::with_capacity_and_shards(64 * 1024, num_shards, 0, 0)
     }
@@ -295,6 +361,22 @@ impl ConcurrentSkipList {
     ///
     /// `max_memory_bytes` triggers seal when memory usage exceeds this limit (0 = unlimited).
     /// `max_entries` triggers seal when live entry count exceeds this limit (0 = unlimited).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// // 64KB per shard, 4 shards, auto-seal at 1MB or 100k entries
+    /// let sl = ConcurrentSkipList::with_capacity_and_shards(
+    ///     64 * 1024,
+    ///     4,
+    ///     1024 * 1024,
+    ///     100_000,
+    /// );
+    /// assert_eq!(sl.max_memory_bytes(), 1024 * 1024);
+    /// assert_eq!(sl.max_entries(), 100_000);
+    /// ```
     pub fn with_capacity_and_shards(
         arena_bytes: usize,
         num_shards: usize,
@@ -336,6 +418,16 @@ impl ConcurrentSkipList {
     ///
     /// Use [`try_insert`](Self::try_insert) to distinguish the failure cases.
     /// Thread-safe: multiple writers can call concurrently.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// assert!(sl.insert(b"key1", b"val1"));
+    /// assert!(!sl.insert(b"key1", b"val2")); // duplicate rejected
+    /// ```
     #[inline]
     pub fn insert(&self, key: &[u8], value: &[u8]) -> bool {
         if self.sealed.load(Ordering::Acquire) {
@@ -359,6 +451,16 @@ impl ConcurrentSkipList {
     ///
     /// Unlike [`insert`](Self::insert), this distinguishes between
     /// `DuplicateKey` and `OutOfMemory` failures.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::{ConcurrentSkipList, InsertError};
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// assert!(sl.try_insert(b"key", b"val").is_ok());
+    /// assert_eq!(sl.try_insert(b"key", b"val2"), Err(InsertError::DuplicateKey));
+    /// ```
     #[inline]
     pub fn try_insert(&self, key: &[u8], value: &[u8]) -> Result<(), InsertError> {
         if self.sealed.load(Ordering::Acquire) {
@@ -396,6 +498,21 @@ impl ConcurrentSkipList {
     /// Returns true if backpressure is active (near capacity limit).
     ///
     /// Backpressure triggers at 90% of the configured limit.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::with_capacity_and_shards(256, 4, 1000, 0);
+    /// assert!(!sl.is_under_backpressure());
+    ///
+    /// // Fill until backpressure kicks in (90% of 1000 bytes)
+    /// for i in 0..50 {
+    ///     sl.insert(format!("key:{:04}", i).as_bytes(), b"xxxxxxxxxxxxxxxxxxxx");
+    /// }
+    /// assert!(sl.is_under_backpressure());
+    /// ```
     pub fn is_under_backpressure(&self) -> bool {
         if self.max_memory_bytes > 0 {
             let threshold = (self.max_memory_bytes as f64 * 0.9) as usize;
@@ -423,6 +540,24 @@ impl ConcurrentSkipList {
     /// one insert will be rejected as a duplicate. For truly concurrent
     /// updates, use [`insert`](Self::insert) directly and handle the
     /// duplicate rejection.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    ///
+    /// // First call inserts
+    /// let (val, is_new) = sl.get_or_insert(b"key", b"default");
+    /// assert!(is_new);
+    /// assert_eq!(val, b"default");
+    ///
+    /// // Second call returns existing
+    /// let (val, is_new) = sl.get_or_insert(b"key", b"other");
+    /// assert!(!is_new);
+    /// assert_eq!(val, b"default");
+    /// ```
     #[inline]
     pub fn get_or_insert<'a>(&'a self, key: &[u8], value: &'a [u8]) -> (&'a [u8], bool) {
         if let Some((v, false)) = self.get(key) {
@@ -443,6 +578,17 @@ impl ConcurrentSkipList {
     ///
     /// Returns `Ok(succeeded)` if all succeeded, or `Err(BatchError)` if any failed.
     /// Even on failure, some inserts may have succeeded.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// let batch: &[(&[u8], &[u8])] = &[(b"a", b"1"), (b"b", b"2"), (b"c", b"3")];
+    /// assert_eq!(sl.insert_batch(batch), Ok(3));
+    /// assert_eq!(sl.len(), 3);
+    /// ```
     pub fn insert_batch(&self, entries: &[(&[u8], &[u8])]) -> Result<usize, BatchError> {
         let mut succeeded = 0;
         for (key, value) in entries {
@@ -462,12 +608,41 @@ impl ConcurrentSkipList {
     ///
     /// Returns `None` for missing keys or tombstones (filtered out).
     /// The order matches the input key order.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// sl.insert(b"a", b"1");
+    /// sl.insert(b"b", b"2");
+    /// sl.delete(b"b");
+    ///
+    /// let results = sl.get_many(&[b"a", b"b", b"c"]);
+    /// assert_eq!(results[0], Some(b"1".as_slice()));
+    /// assert_eq!(results[1], None); // tombstoned
+    /// assert_eq!(results[2], None); // missing
+    /// ```
     pub fn get_many<'a>(&'a self, keys: &[&[u8]]) -> Vec<Option<&'a [u8]>> {
         keys.iter().map(|k| self.get_live(k)).collect()
     }
 
     /// Delete a key by writing a tombstone. Returns `false` if the key
     /// was not found, was already tombstoned, or the memtable is sealed.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// sl.insert(b"key", b"val");
+    ///
+    /// assert!(sl.delete(b"key"));
+    /// assert!(!sl.delete(b"key")); // already tombstoned
+    /// assert_eq!(sl.get_live(b"key"), None);
+    /// ```
     #[inline]
     pub fn delete(&self, key: &[u8]) -> bool {
         if self.sealed.load(Ordering::Acquire) {
@@ -490,6 +665,19 @@ impl ConcurrentSkipList {
     }
 
     /// Point lookup returning only live (non-tombstone) entries.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// sl.insert(b"key", b"val");
+    /// assert_eq!(sl.get_live(b"key"), Some(b"val".as_slice()));
+    ///
+    /// sl.delete(b"key");
+    /// assert_eq!(sl.get_live(b"key"), None); // tombstoned
+    /// ```
     #[inline]
     pub fn get_live(&self, key: &[u8]) -> Option<&[u8]> {
         match self.get(key) {
@@ -499,6 +687,17 @@ impl ConcurrentSkipList {
     }
 
     /// Returns `true` if the key exists and is not a tombstone.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// assert!(!sl.contains_key(b"key"));
+    /// sl.insert(b"key", b"val");
+    /// assert!(sl.contains_key(b"key"));
+    /// ```
     #[inline]
     pub fn contains_key(&self, key: &[u8]) -> bool {
         matches!(self.get(key), Some((_, false)))
@@ -507,6 +706,19 @@ impl ConcurrentSkipList {
     // ─── Iteration ─────────────────────────────────────────────────────────
 
     /// Live iterator. May see concurrent inserts mid-iteration.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// sl.insert(b"b", b"2");
+    /// sl.insert(b"a", b"1");
+    ///
+    /// let keys: Vec<_> = sl.iter().map(|e| e.key.to_vec()).collect();
+    /// assert_eq!(keys, vec![b"a", b"b"]); // sorted order
+    /// ```
     pub fn iter(&self) -> Iter<'_> {
         Iter {
             current: self.skiplist.head,
@@ -519,6 +731,26 @@ impl ConcurrentSkipList {
     /// The snapshot captures a sequence number. The iterator skips any node
     /// inserted after the snapshot was taken, providing a true point-in-time
     /// view even under concurrent inserts.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// sl.insert(b"a", b"1");
+    /// sl.insert(b"b", b"2");
+    ///
+    /// let snap = sl.snapshot();
+    ///
+    /// // Insert after snapshot
+    /// sl.insert(b"c", b"3");
+    ///
+    /// // Snapshot sees only "a" and "b"
+    /// assert_eq!(snap.iter().count(), 2);
+    /// // Live iterator sees all three
+    /// assert_eq!(sl.iter().count(), 3);
+    /// ```
     pub fn snapshot(&self) -> Snapshot<'_> {
         let snap_seq = self.skiplist.next_snapshot_seq();
         Snapshot {
@@ -541,6 +773,22 @@ impl ConcurrentSkipList {
     /// Create a cursor positioned at the first key >= `target`.
     ///
     /// Returns `None` if all keys are < target.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// sl.insert(b"a", b"1");
+    /// sl.insert(b"c", b"3");
+    /// sl.insert(b"e", b"5");
+    ///
+    /// let cursor = sl.cursor_at(b"b").unwrap();
+    /// assert_eq!(cursor.entry().unwrap().key, b"c"); // first key >= "b"
+    ///
+    /// assert!(sl.cursor_at(b"z").is_none()); // past all keys
+    /// ```
     pub fn cursor_at(&self, target: &[u8]) -> Option<Cursor<'_>> {
         let mut c = Cursor {
             current: std::ptr::null(),
@@ -556,6 +804,20 @@ impl ConcurrentSkipList {
     // ─── Stats ─────────────────────────────────────────────────────────────
 
     /// Number of live (non-tombstone) entries. Decrements on delete.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// assert_eq!(sl.len(), 0);
+    /// sl.insert(b"a", b"1");
+    /// sl.insert(b"b", b"2");
+    /// assert_eq!(sl.len(), 2);
+    /// sl.delete(b"a");
+    /// assert_eq!(sl.len(), 1);
+    /// ```
     pub fn len(&self) -> usize {
         self.live_count.load(Ordering::Relaxed)
     }
@@ -566,16 +828,50 @@ impl ConcurrentSkipList {
     }
 
     /// Returns `true` if this memtable has been sealed (no more writes).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// assert!(!sl.is_sealed());
+    /// let (frozen, fresh) = sl.seal().unwrap();
+    /// // frozen is always sealed
+    /// assert!(fresh.is_empty());
+    /// ```
     pub fn is_sealed(&self) -> bool {
         self.sealed.load(Ordering::Acquire)
     }
 
     /// Total arena bytes allocated across all shards.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// let before = sl.memory_usage();
+    /// sl.insert(b"key", b"value");
+    /// assert!(sl.memory_usage() > before);
+    /// ```
     pub fn memory_usage(&self) -> usize {
         self.arena.stats().bytes_allocated
     }
 
     /// Total arena bytes reserved across all shards.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// sl.insert(b"key", b"value");
+    /// assert!(sl.memory_reserved() > 0);
+    /// assert!(sl.memory_reserved() >= sl.memory_usage());
+    /// ```
     pub fn memory_reserved(&self) -> usize {
         self.arena.stats().bytes_reserved
     }
@@ -586,6 +882,16 @@ impl ConcurrentSkipList {
     }
 
     /// Bytes not currently in use (reserved - allocated).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// sl.insert(b"key", b"value");
+    /// assert_eq!(sl.memory_idle(), sl.memory_reserved() - sl.memory_usage());
+    /// ```
     pub fn memory_idle(&self) -> usize {
         self.arena.stats().bytes_idle()
     }
@@ -608,16 +914,47 @@ impl ConcurrentSkipList {
     }
 
     /// Total entries attempted (including duplicates/failures).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// sl.insert(b"a", b"1");
+    /// sl.insert(b"a", b"2"); // duplicate, rejected
+    /// sl.insert(b"b", b"3");
+    /// assert_eq!(sl.total_inserts(), 3); // includes the failed one
+    /// assert_eq!(sl.len(), 2);
+    /// ```
     pub fn total_inserts(&self) -> usize {
         self.total_inserts.load(Ordering::Relaxed)
     }
 
     /// Maximum memory bytes configured (0 = unlimited).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::with_capacity_and_shards(1024, 2, 2048, 0);
+    /// assert_eq!(sl.max_memory_bytes(), 2048);
+    /// ```
     pub fn max_memory_bytes(&self) -> usize {
         self.max_memory_bytes
     }
 
     /// Maximum entries configured (0 = unlimited).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::with_capacity_and_shards(1024, 2, 0, 100);
+    /// assert_eq!(sl.max_entries(), 100);
+    /// ```
     pub fn max_entries(&self) -> usize {
         self.max_entries
     }
@@ -634,6 +971,25 @@ impl ConcurrentSkipList {
     /// # Errors
     ///
     /// Returns `SealError::AlreadySealed` if called more than once.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// sl.insert(b"key1", b"val1");
+    /// sl.insert(b"key2", b"val2");
+    ///
+    /// let (frozen, fresh) = sl.seal().unwrap();
+    ///
+    /// // Frozen has the old data (read-only)
+    /// assert_eq!(frozen.len(), 2);
+    ///
+    /// // Fresh is empty and writable
+    /// assert!(fresh.is_empty());
+    /// fresh.insert(b"key3", b"val3");
+    /// ```
     pub fn seal(self) -> Result<(FrozenMemtable, ConcurrentSkipList), SealError> {
         if self.sealed.swap(true, Ordering::Acquire) {
             // Already sealed — we consumed self but it was sealed. We need
@@ -676,6 +1032,21 @@ impl ConcurrentSkipList {
     /// (dangling pointers) and must not be used after this call.
     ///
     /// Prefer [`seal()`](Self::seal) for safe lifecycle management.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let mut sl = ConcurrentSkipList::new();
+    /// sl.insert(b"key", b"val");
+    /// assert_eq!(sl.len(), 1);
+    ///
+    /// // SAFETY: no other threads accessing the list
+    /// unsafe { sl.reset(); }
+    /// assert!(sl.is_empty());
+    /// sl.insert(b"new", b"data");
+    /// ```
     pub unsafe fn reset(&mut self) {
         self.arena.reset_all();
         self.live_count.store(0, Ordering::Relaxed);
@@ -738,61 +1109,212 @@ unsafe impl Sync for FrozenMemtable {}
 
 impl FrozenMemtable {
     /// Iterate over all entries (including tombstones) in sorted order.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// sl.insert(b"b", b"2");
+    /// sl.insert(b"a", b"1");
+    /// sl.delete(b"a");
+    ///
+    /// let (frozen, _) = sl.seal().unwrap();
+    /// let entries: Vec<_> = frozen.iter().collect();
+    /// assert_eq!(entries.len(), 2); // includes tombstone
+    /// assert!(entries[0].is_tombstone); // "a" was deleted (comes first sorted)
+    /// assert!(!entries[1].is_tombstone); // "b" is live
+    /// ```
     pub fn iter(&self) -> Iter<'_> {
         self.inner.iter()
     }
 
     /// Take a point-in-time snapshot.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// sl.insert(b"a", b"1");
+    /// let (frozen, _) = sl.seal().unwrap();
+    ///
+    /// let snap = frozen.snapshot();
+    /// assert_eq!(snap.iter().count(), 1);
+    /// ```
     pub fn snapshot(&self) -> Snapshot<'_> {
         self.inner.snapshot()
     }
 
     /// Create a cursor positioned at the first entry.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// sl.insert(b"a", b"1");
+    /// let (frozen, _) = sl.seal().unwrap();
+    ///
+    /// let mut cursor = frozen.cursor();
+    /// assert!(cursor.next_entry());
+    /// assert_eq!(cursor.entry().unwrap().key, b"a");
+    /// ```
     pub fn cursor(&self) -> Cursor<'_> {
         self.inner.cursor()
     }
 
     /// Create a cursor positioned at the first key >= `target`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// sl.insert(b"a", b"1");
+    /// sl.insert(b"c", b"3");
+    /// let (frozen, _) = sl.seal().unwrap();
+    ///
+    /// let cursor = frozen.cursor_at(b"b").unwrap();
+    /// assert_eq!(cursor.entry().unwrap().key, b"c");
+    /// ```
     pub fn cursor_at(&self, target: &[u8]) -> Option<Cursor<'_>> {
         self.inner.cursor_at(target)
     }
 
     /// Number of live (non-tombstone) entries.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// sl.insert(b"a", b"1");
+    /// sl.delete(b"a");
+    /// let (frozen, _) = sl.seal().unwrap();
+    /// assert_eq!(frozen.len(), 0); // only tombstone remains
+    /// ```
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
     /// Returns `true` if there are no live entries.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// let (frozen, _) = sl.seal().unwrap();
+    /// assert!(frozen.is_empty());
+    /// ```
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
 
     /// Total arena bytes allocated.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// sl.insert(b"key", b"value");
+    /// let (frozen, _) = sl.seal().unwrap();
+    /// assert!(frozen.memory_usage() > 0);
+    /// ```
     pub fn memory_usage(&self) -> usize {
         self.inner.memory_usage()
     }
 
     /// Total arena bytes reserved.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// sl.insert(b"key", b"value");
+    /// let (frozen, _) = sl.seal().unwrap();
+    /// assert!(frozen.memory_reserved() >= frozen.memory_usage());
+    /// ```
     pub fn memory_reserved(&self) -> usize {
         self.inner.memory_reserved()
     }
 
     /// Returns utilization as a fraction (0.0 to 1.0).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// sl.insert(b"key", b"value");
+    /// let (frozen, _) = sl.seal().unwrap();
+    /// assert!(frozen.memory_utilization() > 0.0);
+    /// ```
     pub fn memory_utilization(&self) -> f64 {
         self.inner.memory_utilization()
     }
 
     /// Bytes not currently in use.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// sl.insert(b"key", b"value");
+    /// let (frozen, _) = sl.seal().unwrap();
+    /// assert_eq!(frozen.memory_idle(), frozen.memory_reserved() - frozen.memory_usage());
+    /// ```
     pub fn memory_idle(&self) -> usize {
         self.inner.memory_idle()
     }
 
     /// Point lookup. Returns `(value, is_tombstone)`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// sl.insert(b"key", b"val");
+    /// let (frozen, _) = sl.seal().unwrap();
+    ///
+    /// let (val, tombstone) = frozen.get(b"key").unwrap();
+    /// assert_eq!(val, b"val");
+    /// assert!(!tombstone);
+    /// ```
     pub fn get(&self, key: &[u8]) -> Option<(&[u8], bool)> {
         self.inner.get(key)
     }
 
     /// Point lookup returning only live (non-tombstone) entries.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// sl.insert(b"key", b"val");
+    /// sl.delete(b"key");
+    /// let (frozen, _) = sl.seal().unwrap();
+    ///
+    /// assert_eq!(frozen.get_live(b"key"), None); // tombstoned
+    /// ```
     pub fn get_live(&self, key: &[u8]) -> Option<&[u8]> {
         self.inner.get_live(key)
     }

@@ -107,6 +107,19 @@ impl<'a> Snapshot<'a> {
     /// skipping any node whose insertion sequence number is `>= snap_seq`.
     /// This guarantees that only nodes present at the time of the snapshot
     /// are yielded.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// sl.insert(b"a", b"1");
+    /// let snap = sl.snapshot();
+    ///
+    /// let entries: Vec<_> = snap.iter().collect();
+    /// assert_eq!(entries.len(), 1);
+    /// ```
     pub fn iter(&self) -> SnapshotIter<'a> {
         SnapshotIter {
             current: self.head,
@@ -253,6 +266,20 @@ impl<'a> Cursor<'a> {
     ///
     /// Returns `true` if a key was found (cursor is now valid),
     /// `false` if all keys in the list are `< target` (cursor is invalid).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// sl.insert(b"a", b"1");
+    /// sl.insert(b"c", b"3");
+    ///
+    /// let mut cursor = sl.cursor();
+    /// assert!(cursor.seek(&sl, b"b")); // lands on "c"
+    /// assert_eq!(cursor.entry().unwrap().key, b"c");
+    /// ```
     pub fn seek(&mut self, skiplist: &'a ConcurrentSkipList, target: &[u8]) -> bool {
         // Walk from head to find the predecessor of target
         let mut x = skiplist.skiplist.head;
@@ -299,6 +326,21 @@ impl<'a> Cursor<'a> {
     ///
     /// Returns `true` if a next entry exists (cursor remains valid),
     /// `false` if the end of the list was reached (cursor becomes invalid).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// sl.insert(b"a", b"1");
+    /// sl.insert(b"b", b"2");
+    ///
+    /// let mut cursor = sl.cursor();
+    /// assert!(cursor.next_entry()); // "a"
+    /// assert!(cursor.next_entry()); // "b"
+    /// assert!(!cursor.next_entry()); // end
+    /// ```
     pub fn next_entry(&mut self) -> bool {
         if self.current.is_null() {
             return false;
@@ -310,6 +352,20 @@ impl<'a> Cursor<'a> {
     /// Get the entry at the cursor's current position.
     ///
     /// Returns `None` if the cursor is invalid (at end or not yet seeked).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// sl.insert(b"a", b"1");
+    ///
+    /// let cursor = sl.cursor_at(b"a").unwrap();
+    /// let entry = cursor.entry().unwrap();
+    /// assert_eq!(entry.key, b"a");
+    /// assert_eq!(entry.value, b"1");
+    /// ```
     pub fn entry(&self) -> Option<Entry<'a>> {
         if self.current.is_null() {
             return None;
@@ -325,6 +381,20 @@ impl<'a> Cursor<'a> {
     ///
     /// A cursor is invalid if it was never seeked, if `seek` found no
     /// matching key, or if `next_entry` reached the end of the list.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastskip::ConcurrentSkipList;
+    ///
+    /// let sl = ConcurrentSkipList::new();
+    /// sl.insert(b"a", b"1");
+    ///
+    /// let cursor = sl.cursor_at(b"a").unwrap();
+    /// assert!(cursor.valid());
+    ///
+    /// assert!(sl.cursor_at(b"z").is_none());
+    /// ```
     pub fn valid(&self) -> bool {
         !self.current.is_null()
     }
