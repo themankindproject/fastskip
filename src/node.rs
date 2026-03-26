@@ -312,12 +312,16 @@ mod tests {
 
     #[test]
     fn test_tower_ptr_basic() {
-        let p = TowerPtr::new(0x1234_5678 as *const u8);
+        // Use a real allocation to avoid integer-to-pointer casts under Miri
+        let dummy = Box::into_raw(Box::new(42u8));
+        let p = TowerPtr::new(dummy);
         assert!(!p.is_null());
-        assert_eq!(p.ptr(), 0x1234_5678 as *const u8);
+        assert_eq!(p.ptr(), dummy);
 
         assert!(TowerPtr::NULL.is_null());
         assert_eq!(TowerPtr::NULL.ptr(), std::ptr::null());
+
+        unsafe { drop(Box::from_raw(dummy)) };
     }
 
     #[test]
@@ -326,7 +330,9 @@ mod tests {
         unsafe {
             init_node(ptr, 2, b"", b"", false, 1);
 
-            let target = TowerPtr::new(0x1000 as *const u8);
+            // Use a real allocation to avoid integer-to-pointer casts under Miri
+            let dummy = Box::into_raw(Box::new(99u8));
+            let target = TowerPtr::new(dummy);
             tower_store(ptr, 0, target);
             assert_eq!(tower_load(ptr, 0), target);
 
@@ -335,6 +341,7 @@ mod tests {
             let atomic = ptr.add(offset).cast::<AtomicU64>();
             assert_eq!((*atomic).load(Ordering::Acquire), target.raw());
 
+            drop(Box::from_raw(dummy));
             std::alloc::dealloc(ptr, layout);
         }
     }

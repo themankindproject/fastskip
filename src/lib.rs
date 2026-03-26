@@ -544,9 +544,16 @@ impl std::fmt::Debug for ConcurrentSkipList {
 
 /// Simple CPU count detection.
 fn num_cpus() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
+    #[cfg(miri)]
+    {
+        4
+    }
+    #[cfg(not(miri))]
+    {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+    }
 }
 
 // ─── FrozenMemtable ────────────────────────────────────────────────────────────

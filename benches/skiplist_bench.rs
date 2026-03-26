@@ -212,7 +212,7 @@ fn bench_concurrent_insert(c: &mut Criterion) {
     for &threads in &[4, 8] {
         group.bench_with_input(BenchmarkId::new("fastskip", threads), &threads, |b, &t| {
             b.iter(|| {
-                let sl = Arc::new(ConcurrentSkipList::new());
+                let sl = Arc::new(ConcurrentSkipList::with_shards(t * 2));
 
                 let mut handles = vec![];
                 for tid in 0..t {
