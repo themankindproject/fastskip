@@ -1,36 +1,40 @@
-# fastskip — Complete Usage Guide
+# fastskip — Lock-Free Arena-Backed Skip List
 
 > Lock-free arena-backed skip list for LSM-tree memtables. Designed for high-throughput write workloads in storage engines like RocksDB, LevelDB, and CockroachDB.
+
+[![Rust](https://github.com/anomalyco/fastskip/actions/workflows/ci.yml/badge.svg)](https://github.com/anomalyco/fastskip/actions)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![Rust 1.66+](https://img.shields.io/badge/Rust-1.66+-blue.svg)](https://blog.rust-lang.org/2022/12/15/Rust-1.66.0.html)
 
 ---
 
 ## Table of Contents
 
-- [Why fastskip?](#why-fastskip)
-- [Installation](#installation)
+- [Features](#features)
 - [Quick Start](#quick-start)
+- [Architecture](#architecture)
+- [Usage Guide](#usage-guide)
   - [Basic Operations](#basic-operations)
   - [Delete / Tombstones](#delete--tombstones)
   - [Iteration](#iteration)
-- [LSM Memtable Lifecycle](#lsm-memtable-lifecycle)
-- [Concurrent Reads](#concurrent-reads)
-- [Range Scans with Cursor](#range-scans-with-cursor)
+  - [LSM Memtable Lifecycle](#lsm-memtable-lifecycle)
+  - [Concurrent Reads](#concurrent-reads)
+  - [Range Scans](#range-scans)
+  - [Thread Safety](#thread-safety)
 - [API Reference](#api-reference)
   - [ConcurrentSkipList](#concurrentskiplist)
   - [FrozenMemtable](#frozenmemtable)
   - [Entry](#entry)
   - [Cursor](#cursor)
   - [Snapshot](#snapshot)
-  - [InsertError](#inserterror)
-  - [SealError](#sealerror)
-- [Thread Safety](#thread-safety)
-- [Performance](#performance)
+  - [Error Types](#error-types)
 - [Design Notes](#design-notes)
-- [MSRV](#minimum-supported-rust-version)
+- [Changelog](#changelog)
+- [License](#license)
 
 ---
 
-## Why fastskip?
+## Features
 
 | Feature | fastskip | dashmap | std::collections::BTreeMap |
 |---------|----------|---------|----------------------------|
@@ -42,20 +46,23 @@
 | Arena memory | Yes (per-thread shards) | No (heap) | No |
 | Bulk deallocation | Yes | No | No |
 
----
+### Key Capabilities
 
-## Installation
-
-```toml
-[dependencies]
-fastskip = "0.1"
-```
+- **O(1) insert** — Bump allocation from per-thread arena shard
+- **O(log n) get** — Skip list traversal with small constant
+- **Lock-free reads** — No locks required for point lookups
+- **Snapshot isolation** — Point-in-time iteration under concurrent writes
+- **Memory efficiency** — Per-thread arenas avoid allocation contention
+- **Bulk deallocation** — Dropping memtable reclaims all memory at once
 
 ---
 
 ## Quick Start
 
-### Basic Operations
+```toml
+[dependencies]
+fastskip = "0.1"
+```
 
 ```rust
 use fastskip::ConcurrentSkipList;
@@ -70,9 +77,68 @@ assert_eq!(val, b"alice");
 assert!(!tombstone);
 ```
 
+---
+
+## Architecture
+
+### Memory Model
+
+The skip list uses **per-thread arena shards** for allocation:
+
+```
+Thread 0 → Arena 0 (bump pointer, no sync)
+Thread 1 → Arena 1 (bump pointer, no sync)
+Thread 2 → Arena 2 (bump pointer, no sync)
+          ↓
+    SkipList (atomic tower pointers)
+```
+
+Each writer thread has its own arena shard. Writes don't contend on allocation — they're pure bump pointer operations. The skip list itself uses atomic operations for the lock-free CAS at level 0.
+
+### Node Layout
+
+Nodes are allocated as a single contiguous block:
+
+```
+[ header (32 bytes) ]
+[ tower[0..height-1] ]  (8 bytes each)
+[ key bytes ]
+[ value bytes ]
+```
+
+Key and value are stored inline after the tower, enabling zero-copy reads.
+
+---
+
+## Usage Guide
+
+### Basic Operations
+
+```rust
+use fastskip::ConcurrentSkipList;
+
+let sl = ConcurrentSkipList::new();
+
+// Insert key-value pairs
+sl.insert(b"user:1001", b"alice");
+sl.insert(b"user:1002", b"bob");
+
+// Point lookup
+let (val, is_tombstone) = sl.get(b"user:1001").unwrap();
+assert_eq!(val, b"alice");
+assert!(!is_tombstone);
+
+// Check if key exists (non-deleted)
+assert!(sl.contains_key(b"user:1001"));
+
+// Get or insert atomically
+let (val, is_new) = sl.get_or_insert(b"user:1003", b"charlie");
+assert!(is_new);
+```
+
 ### Delete / Tombstones
 
-Delete marks a key with a tombstone. Deleted keys remain in the skip list until the memtable is flushed to an SSTable.
+Delete marks a key with a tombstone. Deleted keys remain in the skip list until flushed to SSTable.
 
 ```rust
 use fastskip::ConcurrentSkipList;
@@ -80,7 +146,7 @@ use fastskip::ConcurrentSkipList;
 let sl = ConcurrentSkipList::new();
 sl.insert(b"key", b"value");
 
-// Delete returns true if key was found and marked
+// Delete returns true if key was found
 assert!(sl.delete(b"key"));
 
 // get still returns the key, but with tombstone = true
@@ -108,9 +174,7 @@ for entry in sl.iter() {
 }
 ```
 
----
-
-## LSM Memtable Lifecycle
+### LSM Memtable Lifecycle
 
 The intended lifecycle for an LSM-tree storage engine:
 
@@ -127,12 +191,12 @@ memtable.delete(b"key2");
 // 3. When full, seal it — returns frozen (for flushing) + fresh (for writes)
 let (frozen, fresh) = memtable.seal().unwrap();
 
-// 4. Flush frozen to SSTable (iterate snapshot)
+// 4. Flush frozen to SSTable
 for entry in frozen.iter() {
     if entry.is_tombstone {
-        // write tombstone marker to SSTable
+        // write tombstone marker
     } else {
-        // write key-value to SSTable
+        // write key-value
     }
 }
 
@@ -143,11 +207,9 @@ std::mem::drop(frozen);
 fresh.insert(b"key3", b"val3");
 ```
 
----
+### Concurrent Reads
 
-## Concurrent Reads
-
-Readers are fully lock-free. For consistent point-in-time reads under concurrent writes, use a snapshot:
+Readers are fully lock-free. For consistent point-in-time reads, use a snapshot:
 
 ```rust
 use fastskip::ConcurrentSkipList;
@@ -156,10 +218,10 @@ let sl = ConcurrentSkipList::new();
 sl.insert(b"a", b"1");
 sl.insert(b"b", b"2");
 
-// Snapshot captures a sequence number — iterators skip post-snapshot inserts
+// Snapshot captures sequence number — skips post-snapshot inserts
 let snap = sl.snapshot();
 
-// Insert more after snapshot (won't appear in snapshot iteration)
+// Insert more after snapshot
 sl.insert(b"c", b"3");
 
 // Snapshot sees only "a" and "b"
@@ -168,9 +230,7 @@ assert_eq!(snap.iter().count(), 2);
 assert_eq!(sl.iter().count(), 3);
 ```
 
----
-
-## Range Scans with Cursor
+### Range Scans
 
 Use `cursor_at` to seek to a key range:
 
@@ -184,215 +244,16 @@ sl.insert(b"cherry", b"3");
 sl.insert(b"date", b"4");
 
 // Seek to first key >= "banana"
-if let Some(cursor) = sl.cursor_at(b"banana") {
-    let keys: Vec<_> = cursor
-        .filter(|e| !e.is_tombstone)
-        .map(|e| e.key.to_vec())
-        .collect();
-    assert_eq!(keys, vec![b"banana".to_vec(), b"cherry".to_vec(), b"date".to_vec()]);
-}
-```
-
----
-
-## API Reference
-
-### ConcurrentSkipList
-
-The main lock-free skip list. `Send + Sync` — can be shared across threads.
-
-#### Constructors
-
-| Method | Description |
-|--------|-------------|
-| `new()` | Create with default shard count (CPU count) |
-| `with_shards(n)` | Create with `n` arena shards |
-| `with_capacity(bytes)` | Create with custom arena capacity |
-| `with_capacity_and_shards(bytes, n)` | Create with custom capacity and shards |
-
-```rust
-let sl = ConcurrentSkipList::new();
-let sl = ConcurrentSkipList::with_shards(8);
-let sl = ConcurrentSkipList::with_capacity(1024 * 1024); // 1 MiB
-```
-
-#### Write Operations
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `insert` | `fn insert(&self, key: &[u8], value: &[u8]) -> bool` | Insert, returns false on OOM/duplicate |
-| `try_insert` | `fn try_insert(&self, key: &[u8], value: &[u8]) -> Result<(), InsertError>` | Typed error on failure |
-| `delete` | `fn delete(&self, key: &[u8]) -> bool` | Delete (tombstone), returns false if not found |
-| `get_or_insert` | `fn get_or_insert(&self, key: &[u8], value: &[u8]) -> (&[u8], bool)` | Get or insert atomically |
-
-```rust
-let sl = ConcurrentSkipList::new();
-
-// Simple insert
-sl.insert(b"key", b"value");
-
-// Typed error handling
-match sl.try_insert(b"key", b"value") {
-    Ok(()) => println!("inserted"),
-    Err(InsertError::DuplicateKey) => println!("already exists"),
-    Err(InsertError::OutOfMemory) => println!("out of memory"),
-}
-
-// Delete
-if sl.delete(b"key") {
-    println!("marked as deleted");
-}
-
-// Get or insert
-let (value, is_new) = sl.get_or_insert(b"key", b"default");
-```
-
-#### Read Operations
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `get` | `fn get(&self, key: &[u8]) -> Option<(&[u8], bool)>` | Returns `(value, is_tombstone)` |
-| `get_live` | `fn get_live(&self, key: &[u8]) -> Option<&[u8]>` | Returns `None` if deleted or missing |
-| `contains_key` | `fn contains_key(&self, key: &[u8]) -> bool` | Returns true if key exists and is not deleted |
-
-#### Iteration
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `iter` | `fn iter(&self) -> Iter<'_>` | Live iterator (may see concurrent inserts) |
-| `snapshot` | `fn snapshot(&self) -> Snapshot<'_>` | Point-in-time snapshot |
-| `cursor` | `fn cursor(&self) -> Cursor<'_>` | Cursor at first entry |
-| `cursor_at` | `fn cursor_at(&self, target: &[u8]) -> Option<Cursor<'_>>` | Cursor at first key >= target |
-
-#### Stats
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `len` | `fn len(&self) -> usize` | Number of live (non-tombstone) entries |
-| `is_empty` | `fn is_empty(&self) -> bool` | Returns true if no live entries |
-| `is_sealed` | `fn is_sealed(&self) -> bool` | Returns true if sealed |
-| `memory_usage` | `fn memory_usage(&self) -> usize` | Total arena bytes allocated |
-| `memory_reserved` | `fn memory_reserved(&self) -> usize` | Total arena bytes reserved |
-| `memory_utilization` | `fn memory_utilization(&self) -> f64` | Utilization (0.0 to 1.0) |
-| `memory_idle` | `fn memory_idle(&self) -> usize` | Reserved but unused bytes |
-
-```rust
-let sl = ConcurrentSkipList::new();
-sl.insert(b"key", b"value");
-
-println!("allocated: {} bytes", sl.memory_usage());
-println!("reserved: {} bytes", sl.memory_reserved());
-println!("utilization: {:.1}%", sl.memory_utilization() * 100.0);
-println!("idle: {} bytes", sl.memory_idle());
-```
-
-#### Lifecycle
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `seal` | `fn seal(self) -> Result<(FrozenMemtable, Self), SealError>` | Seal and create fresh memtable |
-| `reset` | `unsafe fn reset(&mut self)` | Reset for reuse (must be quiescent) |
-
----
-
-### FrozenMemtable
-
-A sealed (read-only) memtable created by `seal()`. Used for flushing to SSTable.
-
-#### Methods
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `iter` | `fn iter(&self) -> Iter<'_>` | Iterate all entries |
-| `snapshot` | `fn snapshot(&self) -> Snapshot<'_>` | Point-in-time snapshot |
-| `cursor` | `fn cursor(&self) -> Cursor<'_>` | Cursor at first entry |
-| `cursor_at` | `fn cursor_at(&self, target: &[u8]) -> Option<Cursor<'_>>` | Cursor at target |
-| `len` | `fn len(&self) -> usize` | Live entry count |
-| `is_empty` | `fn is_empty(&self) -> bool` | Returns true if empty |
-| `memory_usage` | `fn memory_usage(&self) -> usize` | Arena bytes allocated |
-| `memory_reserved` | `fn memory_reserved(&self) -> usize` | Arena bytes reserved |
-| `memory_utilization` | `fn memory_utilization(&self) -> f64` | Utilization (0.0 to 1.0) |
-| `memory_idle` | `fn memory_idle(&self) -> usize` | Reserved but unused |
-| `get` | `fn get(&self, key: &[u8]) -> Option<(&[u8], bool)>` | Point lookup |
-| `get_live` | `fn get_live(&self, key: &[u8]) -> Option<&[u8]>` | Point lookup (live only) |
-
----
-
-### Entry
-
-A key-value entry returned by iterators.
-
-```rust
-pub struct Entry {
-    pub key: &[u8],
-    pub value: &[u8],
-    pub is_tombstone: bool,
-}
-```
-
----
-
-### Cursor
-
-A positioned iterator for range scans.
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `next_entry` | `fn next_entry(&mut self) -> bool` | Advance, returns false at end |
-| `entry` | `fn entry(&self) -> Option<Entry>` | Current entry |
-| `seek` | `fn seek(&mut self, target: &[u8]) -> bool` | Seek to first key >= target |
-
-Implements `Iterator<Entry>`.
-
-```rust
 let mut cursor = sl.cursor_at(b"banana").unwrap();
 while let Some(entry) = cursor.next_entry() {
     println!("{:?}", entry.key);
 }
+// Output: banana, cherry, date
 ```
 
----
+### Thread Safety
 
-### Snapshot
-
-A point-in-time view for consistent iteration.
-
-```rust
-let snap = sl.snapshot();
-for entry in snap.iter() {
-    // Sees only entries that existed when snapshot was taken
-}
-```
-
----
-
-### InsertError
-
-```rust
-pub enum InsertError {
-    DuplicateKey,  // Key already exists
-    OutOfMemory,   // Arena shard is out of memory
-}
-```
-
----
-
-### SealError
-
-```rust
-pub enum SealError {
-    AlreadySealed, // Memtable was already sealed
-}
-```
-
----
-
-## Thread Safety
-
-`ConcurrentSkipList` is `Send + Sync` and can be shared across threads:
-
-- **Writers**: Multiple threads can call `insert`/`delete` concurrently. Each thread writes to its own arena shard.
-- **Readers**: `get`, `iter`, and `snapshot` are lock-free. No locks or atomics required for reads.
+`ConcurrentSkipList` is `Send + Sync` — can be shared across threads:
 
 ```rust
 use fastskip::ConcurrentSkipList;
@@ -421,22 +282,150 @@ t2.join().unwrap();
 assert_eq!(sl.len(), 2000);
 ```
 
+### Memory Stats
+
+```rust
+use fastskip::ConcurrentSkipList;
+
+let sl = ConcurrentSkipList::new();
+sl.insert(b"key", b"value");
+
+println!("allocated: {} bytes", sl.memory_usage());
+println!("reserved: {} bytes", sl.memory_reserved());
+println!("utilization: {:.1}%", sl.memory_utilization() * 100.0);
+println!("idle: {} bytes", sl.memory_idle());
+```
+
 ---
 
-## Performance
+## API Reference
 
-### Architecture
+### ConcurrentSkipList
 
-- **O(1) insert**: Bump allocation from per-thread arena shard
-- **O(log n) get**: Skip list traversal (~log n with small constant)
-- **O(log n + m) range scan**: Seek + m iterations
-- **Zero allocation for reads**: Readers never allocate
+The main lock-free skip list. `Send + Sync`.
 
-### Memory
+#### Constructors
 
-- Arena shards: One per thread, avoids allocation contention
-- Bulk deallocation: Dropping the memtable reclaims all memory at once
-- No per-node free overhead
+| Method | Description |
+|--------|-------------|
+| `new()` | Create with default shard count (CPU count) |
+| `with_shards(n)` | Create with `n` arena shards |
+| `with_capacity(bytes)` | Create with custom arena capacity |
+| `with_capacity_and_shards(bytes, n)` | Custom capacity and shards |
+
+#### Write Operations
+
+| Method | Description |
+|--------|-------------|
+| `insert(key, value)` | Insert, returns false on OOM/duplicate |
+| `try_insert(key, value)` | Returns `Result<(), InsertError>` |
+| `delete(key)` | Delete (tombstone), returns false if not found |
+| `get_or_insert(key, value)` | Get or insert atomically |
+
+#### Read Operations
+
+| Method | Description |
+|--------|-------------|
+| `get(key)` | Returns `Option<(value, is_tombstone)>` |
+| `get_live(key)` | Returns `None` if deleted or missing |
+| `contains_key(key)` | Returns true if key exists and not deleted |
+
+#### Iteration
+
+| Method | Description |
+|--------|-------------|
+| `iter()` | Live iterator |
+| `snapshot()` | Point-in-time snapshot |
+| `cursor()` | Cursor at first entry |
+| `cursor_at(target)` | Cursor at first key >= target |
+
+#### Stats
+
+| Method | Description |
+|--------|-------------|
+| `len()` | Number of live entries |
+| `is_empty()` | Returns true if no live entries |
+| `is_sealed()` | Returns true if sealed |
+| `memory_usage()` | Arena bytes allocated |
+| `memory_reserved()` | Arena bytes reserved |
+| `memory_utilization()` | Utilization (0.0 to 1.0) |
+| `memory_idle()` | Reserved but unused bytes |
+
+#### Lifecycle
+
+| Method | Description |
+|--------|-------------|
+| `seal()` | Seal and create fresh memtable |
+| `reset()` (unsafe) | Reset for reuse |
+
+---
+
+### FrozenMemtable
+
+A sealed (read-only) memtable created by `seal()`.
+
+| Method | Description |
+|--------|-------------|
+| `iter()` | Iterate all entries |
+| `snapshot()` | Point-in-time snapshot |
+| `cursor()` / `cursor_at()` | Range scan |
+| `len()` / `is_empty()` | Entry count |
+| `memory_*()` | Memory stats |
+| `get()` / `get_live()` | Point lookup |
+
+---
+
+### Entry
+
+```rust
+pub struct Entry<'a> {
+    pub key: &'a [u8],
+    pub value: &'a [u8],
+    pub is_tombstone: bool,
+}
+```
+
+---
+
+### Cursor
+
+A positioned iterator for range scans.
+
+| Method | Description |
+|--------|-------------|
+| `next_entry()` | Advance, returns false at end |
+| `entry()` | Current entry |
+| `seek(target)` | Seek to first key >= target |
+
+Implements `Iterator<Entry>`.
+
+---
+
+### Snapshot
+
+A point-in-time view for consistent iteration.
+
+```rust
+let snap = sl.snapshot();
+for entry in snap.iter() {
+    // Sees only entries at snapshot time
+}
+```
+
+---
+
+### Error Types
+
+```rust
+pub enum InsertError {
+    DuplicateKey,  // Key already exists
+    OutOfMemory,   // Arena shard out of memory
+}
+
+pub enum SealError {
+    AlreadySealed, // Memtable was already sealed
+}
+```
 
 ---
 
@@ -444,18 +433,39 @@ assert_eq!(sl.len(), 2000);
 
 ### Insert After Delete
 
-Inserting a key that was previously tombstoned in the **same** memtable returns `false` (duplicate). This is by design — the skip list maintains one node per key. To re-insert a deleted key, seal the memtable and write to a fresh one.
+Inserting a key that was tombstoned in the same memtable returns `false` (duplicate). Seal the memtable and write to a fresh one to re-insert.
 
 ### Empty Keys
 
-The internal sentinel head node uses an empty key. User-inserted empty keys (`b""`) work correctly for `get`, `insert`, and `delete`, and are yielded by iterators. The sentinel is identified by its position, not key content.
+User-inserted empty keys (`b""`) work correctly. The sentinel head node uses an empty key identified by position.
 
 ### Memory Management
 
-Arena memory is bulk-allocated in blocks and bulk-reclaimed when the `ConcurrentSkipList` is dropped. No per-node allocation or deallocation overhead.
+Arena memory is bulk-allocated in blocks and bulk-reclaimed when the memtable is dropped. No per-node allocation/deallocation overhead.
 
 ---
 
-## Minimum Supported Rust Version
+## Changelog
 
-**Rust 1.66.0**
+### v0.1.0
+
+- Initial release
+- Lock-free skip list with per-thread arena shards
+- Point lookups, iteration, snapshots
+- Tombstone delete support
+- Seal/freeze lifecycle for LSM memtables
+- Range cursors for prefix scans
+
+### v0.1.1
+
+- Added memory utilization metrics:
+  - `memory_reserved()` — total arena capacity
+  - `memory_utilization()` — fraction used (0.0-1.0)
+  - `memory_idle()` — unused bytes
+- Updated documentation
+
+---
+
+## License
+
+MIT License — see [LICENSE](LICENSE) for details.
