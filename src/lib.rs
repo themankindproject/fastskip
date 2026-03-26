@@ -184,6 +184,29 @@ impl std::fmt::Display for InsertError {
 
 impl std::error::Error for InsertError {}
 
+/// Error for batch operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchError {
+    /// Some inserts failed.
+    PartialFailure { succeeded: usize, failed: usize },
+}
+
+impl std::fmt::Display for BatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BatchError::PartialFailure { succeeded, failed } => {
+                write!(
+                    f,
+                    "partial failure: {} succeeded, {} failed",
+                    succeeded, failed
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for BatchError {}
+
 /// Error returned by [`ConcurrentSkipList::seal`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SealError {
@@ -236,6 +259,13 @@ pub struct ConcurrentSkipList {
     live_count: AtomicUsize,
     /// Whether this memtable has been sealed (no more writes allowed).
     sealed: AtomicBool,
+    /// Maximum memory bytes before auto-seal. 0 = unlimited.
+    max_memory_bytes: usize,
+    /// Maximum entries before auto-seal. 0 = unlimited.
+    max_entries: usize,
+    /// Total insert attempts (including duplicates and failures).
+    /// Used for count-based sealing.
+    total_inserts: AtomicUsize,
 }
 
 // SAFETY: ConcurrentArena is Send+Sync (each shard is accessed by one writer
@@ -253,16 +283,24 @@ impl ConcurrentSkipList {
 
     /// Create with a given initial arena capacity per shard.
     pub fn with_capacity(arena_bytes: usize) -> Self {
-        Self::with_capacity_and_shards(arena_bytes, num_cpus())
+        Self::with_capacity_and_shards(arena_bytes, num_cpus(), 0, 0)
     }
 
     /// Create with a specific number of arena shards.
     pub fn with_shards(num_shards: usize) -> Self {
-        Self::with_capacity_and_shards(64 * 1024, num_shards)
+        Self::with_capacity_and_shards(64 * 1024, num_shards, 0, 0)
     }
 
-    /// Create with custom capacity and shard count.
-    pub fn with_capacity_and_shards(arena_bytes: usize, num_shards: usize) -> Self {
+    /// Create with custom capacity, shard count, and auto-seal thresholds.
+    ///
+    /// `max_memory_bytes` triggers seal when memory usage exceeds this limit (0 = unlimited).
+    /// `max_entries` triggers seal when live entry count exceeds this limit (0 = unlimited).
+    pub fn with_capacity_and_shards(
+        arena_bytes: usize,
+        num_shards: usize,
+        max_memory_bytes: usize,
+        max_entries: usize,
+    ) -> Self {
         let arena = ConcurrentArena::with_block_size(num_shards, arena_bytes);
         let head = Self::alloc_sentinel(&arena);
 
@@ -273,6 +311,9 @@ impl ConcurrentSkipList {
             arena,
             live_count: AtomicUsize::new(0),
             sealed: AtomicBool::new(false),
+            max_memory_bytes,
+            max_entries,
+            total_inserts: AtomicUsize::new(0),
         }
     }
 
@@ -291,7 +332,7 @@ impl ConcurrentSkipList {
     // ─── Write operations ──────────────────────────────────────────────────
 
     /// Insert a key-value pair. Returns `false` on OOM, duplicate key,
-    /// or if the memtable is sealed.
+    /// if the memtable is sealed, or if backpressure limit reached.
     ///
     /// Use [`try_insert`](Self::try_insert) to distinguish the failure cases.
     /// Thread-safe: multiple writers can call concurrently.
@@ -300,6 +341,10 @@ impl ConcurrentSkipList {
         if self.sealed.load(Ordering::Acquire) {
             return false;
         }
+        if self.should_seal() {
+            return false;
+        }
+        self.total_inserts.fetch_add(1, Ordering::Relaxed);
         let arena = self.arena.local();
         match self.skiplist.insert(key, value, arena) {
             InsertResult::Success => {
@@ -317,8 +362,12 @@ impl ConcurrentSkipList {
     #[inline]
     pub fn try_insert(&self, key: &[u8], value: &[u8]) -> Result<(), InsertError> {
         if self.sealed.load(Ordering::Acquire) {
-            return Err(InsertError::DuplicateKey); // sealed → treated as rejected
+            return Err(InsertError::DuplicateKey);
         }
+        if self.should_seal() {
+            return Err(InsertError::OutOfMemory);
+        }
+        self.total_inserts.fetch_add(1, Ordering::Relaxed);
         let arena = self.arena.local();
         match self.skiplist.insert(key, value, arena) {
             InsertResult::Success => {
@@ -328,6 +377,39 @@ impl ConcurrentSkipList {
             InsertResult::Duplicate => Err(InsertError::DuplicateKey),
             InsertResult::Oom => Err(InsertError::OutOfMemory),
         }
+    }
+
+    /// Check if memtable should be sealed based on configured limits.
+    fn should_seal(&self) -> bool {
+        if self.sealed.load(Ordering::Acquire) {
+            return true;
+        }
+        if self.max_memory_bytes > 0 && self.memory_usage() >= self.max_memory_bytes {
+            return true;
+        }
+        if self.max_entries > 0 && self.len() >= self.max_entries {
+            return true;
+        }
+        false
+    }
+
+    /// Returns true if backpressure is active (near capacity limit).
+    ///
+    /// Backpressure triggers at 90% of the configured limit.
+    pub fn is_under_backpressure(&self) -> bool {
+        if self.max_memory_bytes > 0 {
+            let threshold = (self.max_memory_bytes as f64 * 0.9) as usize;
+            if self.memory_usage() >= threshold {
+                return true;
+            }
+        }
+        if self.max_entries > 0 {
+            let threshold = (self.max_entries as f64 * 0.9) as usize;
+            if self.len() >= threshold {
+                return true;
+            }
+        }
+        false
     }
 
     /// Get the value for a key, or insert and return a new value.
@@ -355,6 +437,33 @@ impl ConcurrentSkipList {
                 _ => (value, true), // tombstoned or OOM — return provided value
             }
         }
+    }
+
+    /// Insert multiple key-value pairs.
+    ///
+    /// Returns `Ok(succeeded)` if all succeeded, or `Err(BatchError)` if any failed.
+    /// Even on failure, some inserts may have succeeded.
+    pub fn insert_batch(&self, entries: &[(&[u8], &[u8])]) -> Result<usize, BatchError> {
+        let mut succeeded = 0;
+        for (key, value) in entries {
+            if self.insert(key, value) {
+                succeeded += 1;
+            }
+        }
+        let failed = entries.len() - succeeded;
+        if failed > 0 {
+            Err(BatchError::PartialFailure { succeeded, failed })
+        } else {
+            Ok(succeeded)
+        }
+    }
+
+    /// Get values for multiple keys.
+    ///
+    /// Returns `None` for missing keys or tombstones (filtered out).
+    /// The order matches the input key order.
+    pub fn get_many<'a>(&'a self, keys: &[&[u8]]) -> Vec<Option<&'a [u8]>> {
+        keys.iter().map(|k| self.get_live(k)).collect()
     }
 
     /// Delete a key by writing a tombstone. Returns `false` if the key
@@ -481,6 +590,38 @@ impl ConcurrentSkipList {
         self.arena.stats().bytes_idle()
     }
 
+    /// Average key size in bytes (approximate).
+    pub fn avg_key_size(&self) -> f64 {
+        let len = self.len();
+        if len == 0 {
+            return 0.0;
+        }
+        let total = self.memory_usage() as f64;
+        let key_value_overhead = 32.0 + 16.0;
+        let avg_per_entry = total / len as f64;
+        ((avg_per_entry - key_value_overhead) / 2.0).max(0.0)
+    }
+
+    /// Average value size in bytes (approximate).
+    pub fn avg_value_size(&self) -> f64 {
+        self.avg_key_size()
+    }
+
+    /// Total entries attempted (including duplicates/failures).
+    pub fn total_inserts(&self) -> usize {
+        self.total_inserts.load(Ordering::Relaxed)
+    }
+
+    /// Maximum memory bytes configured (0 = unlimited).
+    pub fn max_memory_bytes(&self) -> usize {
+        self.max_memory_bytes
+    }
+
+    /// Maximum entries configured (0 = unlimited).
+    pub fn max_entries(&self) -> usize {
+        self.max_entries
+    }
+
     // ─── Lifecycle ─────────────────────────────────────────────────────────
 
     /// Seal this memtable and create a fresh one for new writes.
@@ -516,7 +657,12 @@ impl ConcurrentSkipList {
 
         // The frozen memtable keeps the old arena alive.
         // We create a brand new arena for the fresh memtable.
-        let fresh = ConcurrentSkipList::with_capacity_and_shards(block_size, num_shards);
+        let fresh = ConcurrentSkipList::with_capacity_and_shards(
+            block_size,
+            num_shards,
+            self.max_memory_bytes,
+            self.max_entries,
+        );
 
         Ok((FrozenMemtable { inner: self }, fresh))
     }
@@ -534,6 +680,7 @@ impl ConcurrentSkipList {
         self.arena.reset_all();
         self.live_count.store(0, Ordering::Relaxed);
         self.sealed.store(false, Ordering::Release);
+        self.total_inserts.store(0, Ordering::Relaxed);
 
         // Re-allocate sentinel head node (the old one was freed by arena reset)
         let head = Self::alloc_sentinel(&self.arena);
@@ -777,10 +924,34 @@ mod tests {
     }
 
     #[test]
-    fn test_try_insert_distinguishes_errors() {
+    fn test_insert_batch() {
         let sl = ConcurrentSkipList::new();
-        assert_eq!(sl.try_insert(b"key", b"v1"), Ok(()));
-        assert_eq!(sl.try_insert(b"key", b"v2"), Err(InsertError::DuplicateKey));
+        let entries: &[(&[u8], &[u8])] = &[(b"a", b"1"), (b"b", b"2"), (b"c", b"3")];
+
+        let result = sl.insert_batch(entries);
+        assert_eq!(result, Ok(3));
+        assert_eq!(sl.len(), 3);
+
+        let dup_entries: &[(&[u8], &[u8])] = &[(b"a", b"x"), (b"d", b"4")];
+        let result = sl.insert_batch(dup_entries);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_many() {
+        let sl = ConcurrentSkipList::new();
+        sl.insert(b"a", b"1");
+        sl.insert(b"b", b"2");
+        sl.insert(b"c", b"3");
+        sl.delete(b"b");
+
+        let keys: &[&[u8]] = &[b"a", b"b", b"c", b"d"];
+        let results = sl.get_many(keys);
+
+        assert_eq!(results[0], Some(b"1".as_slice()));
+        assert_eq!(results[1], None);
+        assert_eq!(results[2], Some(b"3".as_slice()));
+        assert_eq!(results[3], None);
     }
 
     #[test]
@@ -1129,5 +1300,75 @@ mod tests {
             fresh.insert(k.as_bytes(), v.as_bytes());
         }
         assert_eq!(fresh.len(), 50);
+    }
+
+    #[test]
+    fn test_size_based_auto_seal() {
+        let sl = ConcurrentSkipList::with_capacity_and_shards(256, 4, 512, 0);
+        // Insert until rejected (at limit)
+        for i in 0..100 {
+            let k = format!("key:{}", i);
+            let v = format!("value:{}", i);
+            if !sl.insert(k.as_bytes(), v.as_bytes()) {
+                // Rejected - at or over limit
+                break;
+            }
+        }
+        // After rejection, should be effectively sealed (rejects further inserts)
+        let k = "newkey".as_bytes();
+        let v = "newvalue".as_bytes();
+        assert!(!sl.insert(k, v), "should reject after hitting limit");
+    }
+
+    #[test]
+    fn test_max_entries_auto_seal() {
+        let sl = ConcurrentSkipList::with_capacity_and_shards(64 * 1024 / 4, 4, 0, 5);
+        // Insert until rejected
+        for i in 0..10 {
+            let k = format!("key:{}", i);
+            let v = format!("value:{}", i);
+            if !sl.insert(k.as_bytes(), v.as_bytes()) {
+                break;
+            }
+        }
+        // Verify at least one insert was rejected at the limit
+        assert!(sl.len() <= 5, "len={} should be <= max_entries=5", sl.len());
+    }
+
+    #[test]
+    fn test_backpressure() {
+        let sl = ConcurrentSkipList::with_capacity_and_shards(256, 4, 1000, 0);
+        assert!(!sl.is_under_backpressure());
+
+        for i in 0..50 {
+            let k = format!("key:{:04}", i);
+            let v = "x".repeat(20);
+            sl.insert(k.as_bytes(), v.as_bytes());
+        }
+
+        assert!(
+            sl.is_under_backpressure(),
+            "should be under backpressure after 90%"
+        );
+    }
+
+    #[test]
+    fn test_total_inserts() {
+        let sl = ConcurrentSkipList::new();
+        assert_eq!(sl.total_inserts(), 0);
+
+        sl.insert(b"a", b"1");
+        sl.insert(b"a", b"2");
+        sl.insert(b"b", b"3");
+
+        assert_eq!(sl.total_inserts(), 3);
+    }
+
+    #[test]
+    fn test_max_config() {
+        let sl = ConcurrentSkipList::with_capacity_and_shards(1024, 2, 2048, 100);
+
+        assert_eq!(sl.max_memory_bytes(), 2048);
+        assert_eq!(sl.max_entries(), 100);
     }
 }

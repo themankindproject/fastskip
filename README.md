@@ -19,6 +19,9 @@ Lock-free arena-backed skip list for LSM-tree memtables. Designed for high-throu
 | **Range cursors** | Cursor with lower-bound seek for prefix/range iteration |
 | **Seal/freeze lifecycle** | `seal()` freezes memtable for flushing, returns fresh one |
 | **Bulk deallocation** | Dropping memtable reclaims all arena memory at once |
+| **Auto-seal thresholds** | Automatic sealing based on memory usage or entry count |
+| **Backpressure detection** | Detect when nearing capacity limits |
+| **Batch operations** | Efficient bulk insert and multi-get operations |
 
 ## Quick Start
 
@@ -35,14 +38,32 @@ sl.insert(b"user:1002", b"bob");
 let (val, tombstone) = sl.get(b"user:1001").unwrap();
 assert_eq!(val, b"alice");
 assert!(!tombstone);
+```
 
-// Check if key exists (non-deleted)
-assert!(sl.contains_key(b"user:1001"));
+### With Auto-Seal Thresholds
 
-// Iterate in sorted order
-for entry in sl.iter() {
-    println!("{:?} -> {:?}", entry.key, entry.value);
+```rust
+use fastskip::ConcurrentSkipList;
+
+// Create with auto-seal at 1MB memory or 100k entries
+let sl = ConcurrentSkipList::with_capacity_and_shards(
+    64 * 1024,      // 64KB initial arena per shard
+    4,              // 4 shards (should match writer thread count)
+    1 * 1024 * 1024, // Auto-seal at 1MB total memory
+    100_000         // Auto-seal at 100k entries
+);
+
+// Check if nearing limits
+if !sl.is_under_backpressure() {
+    // Safe to insert batch
+    let batch = vec![(b"key1", b"val1"), (b"key2", b"val2")];
+    sl.insert_batch(&batch).unwrap();
 }
+
+// Get memory statistics
+println!("Used: {} bytes", sl.memory_usage());
+println!("Utilization: {:.1}%", sl.memory_utilization() * 100.0);
+println!("Avg key size: {} bytes", sl.avg_key_size() as usize);
 ```
 
 ### Delete / Tombstones
@@ -73,17 +94,28 @@ The intended lifecycle for an LSM-tree storage engine:
 ```rust
 use fastskip::ConcurrentSkipList;
 
-// 1. Create active memtable
-let memtable = ConcurrentSkipList::with_shards(4);
+// 1. Create active memtable with auto-seal thresholds
+let memtable = ConcurrentSkipList::with_capacity_and_shards(
+    10 * 1024 * 1024, // 10 MB per shard
+    4,                // 4 shards
+    50 * 1024 * 1024, // Auto-seal at 50 MB total
+    1_000_000         // Auto-seal at 1M entries
+);
 
 // 2. Concurrent writers insert/delete
 memtable.insert(b"key1", b"val1");
 memtable.delete(b"key2");
 
-// 3. When full, seal — returns frozen (for flush) + fresh (for writes)
+// 3. Check for backpressure before inserting batch
+if !memtable.is_under_backpressure() {
+    let batch = vec![(b"key3", b"val3"), (b"key4", b"val4")];
+    memtable.insert_batch(&batch).unwrap();
+}
+
+// 4. When full (auto-sealed or manual), seal it — returns frozen (for flush) + fresh (for writes)
 let (frozen, fresh) = memtable.seal().unwrap();
 
-// 4. Flush frozen to SSTable
+// 5. Flush frozen to SSTable (iterate snapshot)
 for entry in frozen.iter() {
     if entry.is_tombstone {
         // write tombstone marker to SSTable
@@ -92,11 +124,15 @@ for entry in frozen.iter() {
     }
 }
 
-// 5. Drop frozen (reclaims arena memory)
+// 6. Drop frozen (reclaims arena memory)
 std::mem::drop(frozen);
 
-// 6. Fresh memtable ready for new writes
-fresh.insert(b"key3", b"val3");
+// 7. Fresh memtable ready for new writes
+fresh.insert(b"key5", b"val5");
+
+// Monitor memory usage
+println!("Memory usage: {} bytes", fresh.memory_usage());
+println!("Utilization: {:.1}%", fresh.memory_utilization() * 100.0);
 ```
 
 ### Snapshots — Point-in-Time Iteration
@@ -152,6 +188,11 @@ sl.insert(b"key", b"value");
 println!("allocated: {} bytes", sl.memory_usage());
 println!("reserved: {} bytes", sl.memory_reserved());
 println!("utilization: {:.1}%", sl.memory_utilization() * 100.0);
+println!("idle: {} bytes", sl.memory_idle());
+println!("avg key size: {} bytes", sl.avg_key_size() as usize);
+println!("avg value size: {} bytes", sl.avg_value_size() as usize);
+println!("total insert attempts: {}", sl.total_inserts());
+println!("under backpressure: {}", sl.is_under_backpressure());
 ```
 
 ## Use Cases
@@ -176,6 +217,14 @@ let sl = ConcurrentSkipList::with_shards(8);
 
 // Custom capacity and shards
 let sl = ConcurrentSkipList::with_capacity_and_shards(1024 * 1024, 8);
+
+// With auto-seal thresholds
+let sl = ConcurrentSkipList::with_capacity_and_shards(
+    1024 * 1024,    // 1MB initial arena per shard
+    8,              // 8 shards
+    100 * 1024 * 1024, // Auto-seal at 100MB total memory
+    10_000_000      // Auto-seal at 10M entries
+);
 ```
 
 ## Thread Safety
@@ -220,6 +269,9 @@ assert_eq!(sl.len(), 2000);
 | Duplicates | Rejected (first value wins) |
 | Delete | Tombstone (entry stays, marked deleted) |
 | Re-insert after delete | Seal memtable, write to fresh one |
+| Auto-seal | Size or count based thresholds |
+| Backpressure | 90% threshold warning |
+| Batch ops | insert_batch, get_many |
 
 ## Testing
 
