@@ -1,44 +1,86 @@
+//! Node memory layout and atomic tower operations.
+//!
+//! Each skip list node is a fixed-layout struct allocated from the arena:
+//!
+//! ```text
+//! Offset  Size   Field
+//! 0       4      key_offset   (u32) — offset of key bytes from node start
+//! 4       4      key_len      (u32)
+//! 8       4      value_offset (u32) — offset of value bytes from node start
+//! 12      4      value_len    (u32)
+//! 16      1      flags        (u8)  — bit 0 = tombstone
+//! 17      1      height       (u8)  — tower height (1..MAX_HEIGHT)
+//! 18      6      _pad         (zero-filled)
+//! 24      8      seq          (u64) — insertion sequence number
+//! 32      8*H    tower[0..H]  — each is AtomicU64 storing a TowerPtr
+//! 32+8*H         key bytes
+//! ...            value bytes
+//! ```
+//!
+//! Key and value bytes are stored inline after the tower. Zero-copy
+//! accessors read directly from the arena memory without deserialization.
+
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
+/// Maximum skip list tower height. Limits the number of levels to 20,
+/// which supports lists up to ~2^20 (1M) nodes with high probability.
 pub(crate) const MAX_HEIGHT: usize = 20;
+
+/// Size of the node header in bytes (before the tower array).
 pub(crate) const NODE_HEADER_SIZE: usize = 32;
+
+/// Bitmask for the tombstone flag in the node's `flags` byte.
 pub(crate) const TOMBSTONE_BIT: u8 = 0x01;
+
+/// Byte offset of the `flags` field within the node header.
 pub(crate) const FLAGS_OFFSET: usize = 16;
+
+/// Byte offset of the `seq` field within the node header.
 pub(crate) const NODE_SEQ_OFFSET: usize = 24;
 
 // ─── TowerPtr ──────────────────────────────────────────────────────────────────
-// Packed pointer stored in the skip list tower as AtomicU64.
-// The lower 48 bits hold the pointer value; 0 encodes null.
-// Upper bits are masked off on read for portability.
 
-/// Opaque packed pointer stored in the skip list tower.
+/// Opaque packed pointer stored in the skip list tower as `AtomicU64`.
+///
+/// The lower 48 bits hold the pointer value (sufficient for all current
+/// architectures). A raw value of `0` encodes a null pointer. Upper bits
+/// are masked off on read for portability across platforms.
+///
+/// `TowerPtr` is `#[repr(transparent)]` around `u64`, making it safe to
+/// store and load via `AtomicU64` operations.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TowerPtr(u64);
 
 impl TowerPtr {
+    /// The null tower pointer (raw value `0`).
     pub const NULL: Self = Self(0);
 
+    /// Pack a pointer into a `TowerPtr`.
     #[inline]
     pub fn new(ptr: *const u8) -> Self {
         Self(ptr as usize as u64)
     }
 
+    /// Construct from a raw `u64` value (e.g., loaded from `AtomicU64`).
     #[inline]
     pub fn from_raw(raw: u64) -> Self {
         Self(raw)
     }
 
+    /// Get the raw `u64` representation for atomic store/CAS.
     #[inline]
     pub fn raw(self) -> u64 {
         self.0
     }
 
+    /// Unpack the pointer, masking off upper bits for portability.
     #[inline]
     pub fn ptr(self) -> *const u8 {
         (self.0 & 0x0000_FFFF_FFFF_FFFF) as usize as *const u8
     }
 
+    /// Returns `true` if this is a null pointer.
     #[inline]
     pub fn is_null(self) -> bool {
         self.ptr().is_null()
@@ -46,19 +88,11 @@ impl TowerPtr {
 }
 
 // ─── Node layout ───────────────────────────────────────────────────────────────
-// Offset  Size  Field
-// 0       4     key_offset   (u32)
-// 4       4     key_len      (u32)
-// 8       4     value_offset (u32)
-// 12      4     value_len    (u32)
-// 16      1     flags        (bit 0 = tombstone)
-// 17      1     height       (1..MAX_HEIGHT)
-// 18      6     _pad
-// 24      8     seq          (u64, insertion sequence number)
-// 32      8*H   tower[0..H]  (each is AtomicU64 storing a TowerPtr)
-// 32+8*H        key bytes
-// ...           value bytes
 
+/// Compute the total allocation size for a node with the given tower height,
+/// key length, and value length.
+///
+/// Returns `NODE_HEADER_SIZE + height * 8 + key_len + value_len`.
 #[inline]
 pub(crate) fn node_alloc_size(height: usize, key_len: usize, value_len: usize) -> usize {
     NODE_HEADER_SIZE + height * 8 + key_len + value_len
@@ -114,7 +148,16 @@ pub(crate) unsafe fn init_node(
 
 // ─── Zero-copy accessors ───────────────────────────────────────────────────────
 
-/// # Safety: `ptr` must point to a fully initialized node.
+/// Read the key bytes from a node (zero-copy).
+///
+/// Uses a single 64-bit read to fetch both `key_offset` and `key_len`,
+/// then constructs a slice directly from arena memory.
+///
+/// # Safety
+///
+/// `ptr` must point to a fully initialized node. The returned slice is
+/// valid for the lifetime of the arena (tracked by the `'static` bound
+/// on the raw pointer; actual lifetime is managed by the owning struct).
 #[inline]
 pub(crate) unsafe fn node_key(ptr: *const u8) -> &'static [u8] {
     // Single 64-bit read: [key_offset:u32, key_len:u32]
@@ -124,7 +167,14 @@ pub(crate) unsafe fn node_key(ptr: *const u8) -> &'static [u8] {
     std::slice::from_raw_parts(ptr.add(key_offset), key_len)
 }
 
-/// # Safety: `ptr` must point to a fully initialized node.
+/// Read the value bytes from a node (zero-copy).
+///
+/// Uses a single 64-bit read to fetch both `value_offset` and `value_len`,
+/// then constructs a slice directly from arena memory.
+///
+/// # Safety
+///
+/// `ptr` must point to a fully initialized node.
 #[inline]
 pub(crate) unsafe fn node_value(ptr: *const u8) -> &'static [u8] {
     // Single 64-bit read: [value_offset:u32, value_len:u32]
@@ -134,18 +184,29 @@ pub(crate) unsafe fn node_value(ptr: *const u8) -> &'static [u8] {
     std::slice::from_raw_parts(ptr.add(value_offset), value_len)
 }
 
-/// Check if node has tombstone flag (Acquire load — sees concurrent tombstone).
+/// Check if a node has the tombstone flag set.
 ///
-/// # Safety: `ptr` must point to a fully initialized node.
+/// Uses an Acquire load to synchronize with the Release CAS in
+/// [`set_tombstone`], ensuring the caller sees any prior tombstone.
+///
+/// # Safety
+///
+/// `ptr` must point to a fully initialized node.
 #[inline]
 pub(crate) unsafe fn is_tombstone(ptr: *const u8) -> bool {
     let atomic = &*ptr.add(FLAGS_OFFSET).cast::<AtomicU8>();
     (atomic.load(Ordering::Acquire) & TOMBSTONE_BIT) != 0
 }
 
-/// Atomically set the tombstone flag. Returns true if this call won the CAS.
+/// Atomically set the tombstone flag via CAS.
 ///
-/// # Safety: `ptr` must point to a fully initialized node.
+/// Returns `true` if this call set the flag (won the CAS). Returns `false`
+/// if the flag was already set by a concurrent delete. Uses Release ordering
+/// on success to publish the tombstone, and Acquire on failure to retry.
+///
+/// # Safety
+///
+/// `ptr` must point to a fully initialized node.
 #[inline]
 pub(crate) unsafe fn set_tombstone(ptr: *const u8) -> bool {
     let atomic = &*ptr.add(FLAGS_OFFSET).cast::<AtomicU8>();
@@ -166,7 +227,11 @@ pub(crate) unsafe fn set_tombstone(ptr: *const u8) -> bool {
     }
 }
 
-/// # Safety: `ptr` must point to a fully initialized node.
+/// Read the tower height of a node.
+///
+/// # Safety
+///
+/// `ptr` must point to a fully initialized node.
 #[inline]
 #[allow(dead_code)]
 pub(crate) unsafe fn node_height(ptr: *const u8) -> usize {
@@ -175,11 +240,14 @@ pub(crate) unsafe fn node_height(ptr: *const u8) -> usize {
 
 /// Read the insertion sequence number from a node.
 ///
-/// The seq is written before the Release fence/CAS that publishes the node.
-/// The caller obtained `ptr` via `tower_load` (Acquire), which already
-/// synchronizes with the publishing Release. A Relaxed load is sufficient.
+/// The sequence number was written before the Release fence/CAS that
+/// published the node. Since the caller obtained `ptr` via [`tower_load`]
+/// (Acquire), which synchronizes with the publishing Release, a Relaxed
+/// load is sufficient here.
 ///
-/// # Safety: `ptr` must point to a fully initialized node.
+/// # Safety
+///
+/// `ptr` must point to a fully initialized node.
 #[inline]
 pub(crate) unsafe fn node_seq(ptr: *const u8) -> u64 {
     let atomic = &*ptr.add(NODE_SEQ_OFFSET).cast::<AtomicU64>();
@@ -195,9 +263,16 @@ pub(crate) unsafe fn node_seq(ptr: *const u8) -> u64 {
 // Store: Relaxed  — used during init and upper-level splice (non-publishing)
 // CAS:   Release/Acquire — publishes pointer, sees latest on failure
 
-/// Load a tower pointer (Acquire).
+/// Load a tower pointer at `level` with Acquire ordering.
 ///
-/// # Safety: `node` must be a valid node, `level` < node height.
+/// Acquire ordering ensures that all node contents (key, value, flags)
+/// written before the Release CAS that published this pointer are visible
+/// to the reader.
+///
+/// # Safety
+///
+/// `node` must be a valid, fully initialized node. `level` must be `<`
+/// the node's tower height.
 #[inline]
 pub(crate) unsafe fn tower_load(node: *const u8, level: usize) -> TowerPtr {
     let offset = NODE_HEADER_SIZE + level * 8;
@@ -205,10 +280,16 @@ pub(crate) unsafe fn tower_load(node: *const u8, level: usize) -> TowerPtr {
     TowerPtr::from_raw((*atomic).load(Ordering::Acquire))
 }
 
-/// Store a tower pointer (Relaxed). Used during initialization and upper-level
-/// splice when the pointer is not the publishing mechanism.
+/// Store a tower pointer at `level` with Relaxed ordering.
 ///
-/// # Safety: `node` must be a valid node, `level` < node height.
+/// Used during node initialization (before the node is published) and
+/// during upper-level splice (where the pointer is an optimization hint,
+/// not the publishing mechanism). Relaxed is sufficient because the
+/// Release fence + CAS at level 0 is the actual publication barrier.
+///
+/// # Safety
+///
+/// `node` must be a valid node. `level` must be `<` the node's tower height.
 #[inline]
 pub(crate) unsafe fn tower_store(node: *mut u8, level: usize, val: TowerPtr) {
     let offset = NODE_HEADER_SIZE + level * 8;
@@ -216,10 +297,15 @@ pub(crate) unsafe fn tower_store(node: *mut u8, level: usize, val: TowerPtr) {
     (*atomic).store(val.raw(), Ordering::Relaxed);
 }
 
-/// CAS a tower pointer. Release on success (publishes pointer), Acquire on
-/// failure (sees latest value for retry).
+/// Compare-and-swap a tower pointer at `level`.
 ///
-/// # Safety: `node` must be a valid node, `level` < node height.
+/// Uses Release ordering on success (publishes the new pointer and all
+/// preceding writes) and Acquire on failure (sees the latest value for
+/// retry). This is the core atomic operation that commits inserts.
+///
+/// # Safety
+///
+/// `node` must be a valid node. `level` must be `<` the node's tower height.
 #[inline]
 pub(crate) unsafe fn tower_cas(
     node: *const u8,

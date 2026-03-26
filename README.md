@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/fastskip)](https://crates.io/crates/fastskip)
 [![Documentation](https://docs.rs/fastskip/badge.svg)](https://docs.rs/fastskip)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
-[![Build Status](https://img.shields.io/github/actions/workflow/status/anomalyco/fastskip/ci.yml)](https://github.com/anomalyco/fastskip/actions)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/themankindproject/fastskip/ci.yml)](https://github.com/themankindproject/fastskip/actions)
 ![Rust Version](https://img.shields.io/badge/rust-1.66%2B-blue)
 
 Lock-free arena-backed skip list for LSM-tree memtables. Designed for high-throughput write workloads in storage engines like RocksDB, LevelDB, and CockroachDB.

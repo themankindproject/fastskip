@@ -1,3 +1,15 @@
+//! Core lock-free skip list implementation.
+//!
+//! This module implements the skip list data structure with lock-free
+//! concurrent insertion, deletion, and point lookups. The skip list
+//! uses a single CAS at level 0 to commit inserts atomically, with
+//! best-effort CAS at upper levels for search optimization.
+//!
+//! The algorithm follows the design of RocksDB's `InlineSkipList`
+//! and CockroachDB's `arenaskl`: nodes are allocated from an arena,
+//! published via a Release CAS at level 0, and upper-level pointers
+//! are repaired lazily.
+
 use std::sync::atomic::fence;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -8,22 +20,32 @@ use crate::node::*;
 use crate::util::{compare_keys, prefetch_read};
 
 /// Lock-free skip list backed by an arena allocator.
-/// Single CAS at level 0, best-effort CAS at upper levels.
+///
+/// All concurrent access goes through atomic operations on the node
+/// tower pointers. The sentinel head node has key `b""` and height
+/// [`MAX_HEIGHT`], ensuring all levels have a starting point for
+/// traversal.
 pub(crate) struct SkipList {
     /// Sentinel head node (key = empty, height = MAX_HEIGHT).
+    /// Always the first node in the level-0 chain.
     pub(crate) head: *const u8,
-    /// Current maximum height used by any node.
+    /// Current maximum tower height used by any node in the list.
+    /// Updated via CAS when a node with higher height is inserted.
     pub(crate) height: AtomicUsize,
     /// Monotonic insertion sequence counter for snapshot visibility.
-    /// Sentinel = seq 0, first real node = seq 1, etc.
+    /// The sentinel uses seq 0; the first real node gets seq 1, etc.
+    /// Incremented atomically on every insert attempt.
     pub(crate) next_seq: AtomicUsize,
 }
 
 /// Result of an insert attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InsertResult {
+    /// The key-value pair was successfully inserted.
     Success,
+    /// A node with the same key already exists (duplicate rejection).
     Duplicate,
+    /// The arena shard has insufficient memory for the new node.
     Oom,
 }
 
@@ -31,8 +53,10 @@ impl SkipList {
     /// Create a new skip list with a sentinel head node.
     ///
     /// # Safety
-    /// `head` must point to a valid sentinel node with height MAX_HEIGHT
-    /// and sequence number 0.
+    ///
+    /// `head` must point to a valid sentinel node allocated from the arena
+    /// with height [`MAX_HEIGHT`] and sequence number 0. The sentinel must
+    /// remain valid for the lifetime of this `SkipList`.
     pub(crate) unsafe fn new(head: *const u8) -> Self {
         SkipList {
             head,
@@ -43,16 +67,20 @@ impl SkipList {
 
     // ─── Get (lock-free read) ──────────────────────────────────────────────
 
-    /// Point lookup. Returns `(value, is_tombstone)` if the key exists.
+    /// Lock-free point lookup. Returns `(value, is_tombstone)` if the key exists.
     ///
-    /// Walks from the highest level down. At level 0, if the successor matches
-    /// the key, returns its value and tombstone flag.
-    /// All tower loads use Acquire ordering.
+    /// Walks the skip list from the highest level down. At each level, advances
+    /// along the tower chain until the successor key is `>= target`, then drops
+    /// to the next level. At level 0, if the successor key matches exactly,
+    /// returns the node's value and tombstone flag.
     ///
-    /// Uses Masstree-style lookahead prefetching: we prefetch the successor's
-    /// successor while comparing the current node. Most beneficial when the
-    /// memtable exceeds L3 cache (>1MB); on cache-resident data the overhead
-    /// is neutral.
+    /// All tower loads use Acquire ordering to synchronize with the Release
+    /// CAS that published each node.
+    ///
+    /// Uses Masstree-style lookahead prefetching: while comparing one node,
+    /// the successor's successor is prefetched into L1 cache. Most beneficial
+    /// when the memtable exceeds L3 cache (>1 MB); on cache-resident data the
+    /// overhead is neutral.
     #[inline]
     pub(crate) fn get(&self, key: &[u8]) -> Option<(&[u8], bool)> {
         let mut x = self.head;
@@ -103,7 +131,13 @@ impl SkipList {
 
     // ─── Insert (lock-free write) ──────────────────────────────────────────
 
-    /// Insert a key-value pair. Returns the result of the insertion.
+    /// Insert a key-value pair into the skip list.
+    ///
+    /// Returns [`InsertResult::Success`] on successful insertion,
+    /// [`InsertResult::Duplicate`] if the key already exists, or
+    /// [`InsertResult::Oom`] if the arena shard is out of memory.
+    ///
+    /// Delegates to [`insert_inner`](Self::insert_inner) with `is_tombstone = false`.
     #[inline]
     pub(crate) fn insert(&self, key: &[u8], value: &[u8], arena: &mut Arena) -> InsertResult {
         self.insert_inner(key, value, arena, false)
@@ -221,12 +255,17 @@ impl SkipList {
 
     // ─── Delete (tombstone) ────────────────────────────────────────────────
 
-    /// Delete a key by marking it with a tombstone.
-    /// Returns true if the key was found and tombstoned by this call.
-    /// Returns false if the key was not found or was already tombstoned.
+    /// Delete a key by atomically setting its tombstone flag.
     ///
-    /// Note: under concurrent insert/delete, a delete may return false while
-    /// a concurrent insert of the same key succeeds. This is linearizable —
+    /// Returns `true` if the key was found and tombstoned by this call.
+    /// Returns `false` if the key was not found or was already tombstoned.
+    ///
+    /// The tombstone is set via a CAS on the node's flags byte, making
+    /// the operation idempotent — calling delete twice on the same key
+    /// returns `false` the second time.
+    ///
+    /// Under concurrent insert/delete, a delete may return `false` while
+    /// a concurrent insert of the same key succeeds. This is linearizable:
     /// the operations can be ordered as delete-before-insert.
     #[inline]
     pub(crate) fn delete(&self, key: &[u8]) -> bool {
@@ -276,10 +315,15 @@ impl SkipList {
 
     // ─── find_less ─────────────────────────────────────────────────────────
 
-    /// Find predecessors and successors for the given key at each level.
-    /// Returns (preds, succs) where each entry is a `TowerPtr`.
+    /// Find the predecessor and successor for `key` at each level.
     ///
-    /// Uses Masstree-style lookahead prefetching for cache efficiency.
+    /// Returns two arrays of length [`MAX_HEIGHT`]:
+    /// - `preds[i]` — the last node at level `i` whose key is `< key`
+    /// - `succs[i]` — the first node at level `i` whose key is `>= key`
+    ///
+    /// Used by [`insert_inner`](Self::insert_inner) to locate the splice
+    /// points for the new node at all levels simultaneously. Uses
+    /// Masstree-style lookahead prefetching for cache efficiency.
     #[inline]
     pub(crate) fn find_less(&self, key: &[u8]) -> ([TowerPtr; MAX_HEIGHT], [TowerPtr; MAX_HEIGHT]) {
         let mut preds = [TowerPtr::NULL; MAX_HEIGHT];
@@ -325,18 +369,27 @@ impl SkipList {
         (preds, succs)
     }
 
-    /// Capture the current insertion sequence number for snapshot visibility.
-    /// Any node with seq <= the returned value was fully inserted before
-    /// this call and is visible to the snapshot.
+    /// Capture the current insertion sequence number for snapshot isolation.
+    ///
+    /// Any node with `seq <` the returned value was fully inserted before
+    /// this call and is visible to the snapshot. Nodes inserted concurrently
+    /// after this call get a `seq >=` the returned value and are hidden.
     pub(crate) fn next_snapshot_seq(&self) -> u64 {
         self.next_seq.load(Ordering::Relaxed) as u64
     }
 
     /// Reset the skip list with a new sentinel head node.
     ///
+    /// Clears all state and replaces the sentinel. Used by
+    /// [`ConcurrentSkipList::reset`](crate::ConcurrentSkipList::reset)
+    /// after the arena is reclaimed.
+    ///
     /// # Safety
-    /// `head` must point to a valid sentinel node with height MAX_HEIGHT
+    ///
+    /// `head` must point to a valid sentinel node with height [`MAX_HEIGHT`]
     /// and sequence number 0. No concurrent readers or writers may be active.
+    /// Any existing [`Snapshot`](crate::Snapshot), [`Iter`](crate::Iter), or
+    /// [`Cursor`](crate::Cursor) values become invalid and must not be used.
     pub(crate) unsafe fn reset(&mut self, head: *const u8) {
         self.head = head;
         self.height.store(1, Ordering::Relaxed);

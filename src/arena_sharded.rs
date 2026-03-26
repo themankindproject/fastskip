@@ -1,17 +1,39 @@
+//! Per-thread arena shard pool for lock-free memory allocation.
+//!
+//! This module provides [`ConcurrentArena`], which maintains a fixed number
+//! of arena shards. Each writer thread is assigned a unique shard via atomic
+//! round-robin, ensuring that no two threads ever hold `&mut Arena` to the
+//! same shard (avoiding data races without locking).
+//!
+//! Readers never allocate, so they are contention-free. Thread-local caching
+//! avoids repeated atomic lookups on the hot path.
+
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use fastarena::{Arena, ArenaStats};
 
+/// Default initial block size per arena shard (64 KB).
 #[allow(dead_code)]
 const DEFAULT_INITIAL_BLOCK: usize = 64 * 1024;
 
-/// Pool of per-thread arenas. Each writer thread gets a unique shard via
-/// atomic round-robin assignment. Readers never allocate.
+/// Pool of per-thread arena shards for concurrent allocation.
+///
+/// Each writer thread calls [`local()`](Self::local) to obtain a mutable
+/// reference to its assigned arena shard. Shards are assigned via atomic
+/// round-robin on first access, with the assignment cached in thread-local
+/// storage for subsequent calls.
+///
+/// # Thread safety
+///
+/// The arena is `Send + Sync`. Each concurrent writer thread gets a distinct
+/// shard, so no locking is needed. Readers never allocate and access nodes
+/// through shared references.
 pub(crate) struct ConcurrentArena {
     shards: Vec<UnsafeCell<Arena>>,
     /// Per-instance shard assignment counter. Each call to `local()` from a
-    /// new thread atomically claims the next shard index.
+    /// new thread atomically claims the next shard index. Monotonically
+    /// increments up to `shards.len()`, then panics if exceeded.
     shard_assign: AtomicUsize,
 }
 
@@ -30,13 +52,18 @@ unsafe impl Send for ConcurrentArena {}
 unsafe impl Sync for ConcurrentArena {}
 
 impl ConcurrentArena {
-    /// Create a new ConcurrentArena with the given number of shards.
+    /// Create a new `ConcurrentArena` with the given number of shards
+    /// and the default initial block size (64 KB per shard).
     #[allow(dead_code)]
     pub fn new(num_shards: usize) -> Self {
         Self::with_block_size(num_shards, DEFAULT_INITIAL_BLOCK)
     }
 
-    /// Create a new ConcurrentArena with a custom initial block size per shard.
+    /// Create a new `ConcurrentArena` with a custom initial block size per shard.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num_shards` is 0.
     pub fn with_block_size(num_shards: usize, block_size: usize) -> Self {
         assert!(num_shards > 0, "num_shards must be > 0");
         let mut shards = Vec::with_capacity(num_shards);
@@ -80,7 +107,10 @@ impl ConcurrentArena {
         })
     }
 
-    /// Aggregate stats across all shards.
+    /// Aggregate memory statistics across all shards.
+    ///
+    /// Returns a combined [`ArenaStats`] with total `bytes_allocated`,
+    /// `bytes_reserved`, and `block_count` summed across all shards.
     pub fn stats(&self) -> ArenaStats {
         let mut total = ArenaStats::default();
         for shard in &self.shards {
@@ -93,10 +123,15 @@ impl ConcurrentArena {
         total
     }
 
-    /// Reset all arenas (memtable flush).
+    /// Reset all arena shards, reclaiming all allocated memory.
+    ///
+    /// Called during [`ConcurrentSkipList::reset`](crate::ConcurrentSkipList::reset)
+    /// to reuse the memtable. Also clears this thread's cached shard index.
     ///
     /// # Safety
-    /// No concurrent readers or writers may be active.
+    ///
+    /// No concurrent readers or writers may be active. All pointers into
+    /// the arena become invalid after this call.
     pub unsafe fn reset_all(&mut self) {
         for shard in &mut self.shards {
             shard.get_mut().reset();
@@ -109,14 +144,16 @@ impl ConcurrentArena {
     }
 
     /// Clear the calling thread's cached shard index for all arenas.
-    /// Call this from any thread after a full reset to ensure
-    /// fresh shard assignment on next `local()` call.
+    ///
+    /// Call this from any thread after a full [`reset_all`](Self::reset_all)
+    /// to ensure fresh shard assignment on the next [`local`](Self::local) call.
+    /// Useful when a thread is repurposed after a memtable flush.
     #[allow(dead_code)]
     pub fn reset_local() {
         SHARD_CACHE.with(|cache| cache.borrow_mut().clear());
     }
 
-    /// Number of shards.
+    /// Returns the number of arena shards.
     #[allow(dead_code)]
     pub fn num_shards(&self) -> usize {
         self.shards.len()

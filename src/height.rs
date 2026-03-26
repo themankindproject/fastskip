@@ -1,14 +1,33 @@
+//! Random tower height generation for skip list nodes.
+//!
+//! Each new node is assigned a random tower height using a geometric
+//! distribution (p=0.5). The height determines how many levels the node
+//! participates in, which controls the skip list's search performance.
+//!
+//! Heights are generated using a thread-local splitmix64 PRNG seeded
+//! from the system clock and a global counter, ensuring different
+//! threads get different sequences.
+
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::node::MAX_HEIGHT;
 
+/// Global counter mixed into each thread's seed to ensure distinct
+/// sequences across threads, even if spawned in rapid succession.
 static SEED_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+// Thread-local PRNG state. Each thread gets its own splitmix64 generator
+// seeded from the system clock and a global counter.
 thread_local! {
     static RNG_STATE: Cell<u64> = Cell::new(seed_from_time());
 }
 
+/// Generate a unique seed from the system clock and a global counter.
+///
+/// Combines the current time (seconds XOR nanoseconds) with a monotonic
+/// counter to ensure distinct seeds even for threads spawned within the
+/// same nanosecond. Returns a non-zero value.
 fn seed_from_time() -> u64 {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -24,8 +43,19 @@ fn seed_from_time() -> u64 {
     }
 }
 
-/// O(1) height generation using trailing zeros of a random u64.
-/// Geometric distribution with p=0.5.
+/// Generate a random tower height in `1..=MAX_HEIGHT`.
+///
+/// Uses the number of trailing zeros in a splitmix64 random `u64` plus 1,
+/// which produces a geometric distribution with p=0.5:
+///
+/// - P(height=1) ≈ 0.5
+/// - P(height=2) ≈ 0.25
+/// - P(height=3) ≈ 0.125
+/// - ...and so on, capped at [`MAX_HEIGHT`] (20).
+///
+/// This distribution ensures most nodes only participate in the bottom
+/// few levels (fast insertion), while a few nodes span many levels
+/// (fast lookup). The expected list height is O(log n).
 ///
 /// Uses splitmix64 for better statistical quality than xorshift64.
 pub(crate) fn random_height() -> usize {
@@ -42,6 +72,9 @@ pub(crate) fn random_height() -> usize {
     })
 }
 
+/// Returns the maximum tower height ([`MAX_HEIGHT`] = 20).
+///
+/// Exposed as a `const fn` for use in const contexts and assertions.
 #[allow(dead_code)]
 pub(crate) const fn max_height() -> usize {
     MAX_HEIGHT

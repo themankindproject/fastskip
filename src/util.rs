@@ -1,8 +1,20 @@
-/// Key comparison: lexicographic byte ordering.
+//! Low-level utility functions for key comparison and cache prefetching.
+//!
+//! Provides performance-critical helpers used throughout the skip list:
+//! - [`compare_keys`] — lexicographic byte comparison with fast-path prefixes
+//! - [`prefetch_read`] — CPU cache prefetch hint for lookahead optimization
+
+/// Compare two byte slices in lexicographic (dictionary) order.
 ///
-/// Uses prefix fast-paths (Masstree-inspired). Tries an 8-byte big-endian
-/// u64 compare first, then a 4-byte fallback for short keys. Avoids the
-/// byte-by-byte loop when prefixes differ.
+/// Uses Masstree-inspired fast paths:
+/// 1. If both keys are >= 8 bytes, compare the first 8 bytes as a
+///    big-endian `u64`. If they differ, return immediately.
+/// 2. If both keys are >= 4 bytes (but the 8-byte prefix matched),
+///    compare the first 4 bytes as a big-endian `u32`.
+/// 3. Fall back to standard byte-by-byte comparison via `a.cmp(b)`.
+///
+/// The fast paths avoid the `memcmp`-style loop when prefixes differ,
+/// which is the common case for LSM-tree keys with sorted prefixes.
 #[inline]
 pub(crate) fn compare_keys(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
     if a.len() >= 8 && b.len() >= 8 {

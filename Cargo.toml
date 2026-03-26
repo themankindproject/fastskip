@@ -5,10 +5,14 @@ edition = "2021"
 authors = ["Ashutosh Kumar <kumarashutosh34169@gmail.com>"]
 description = "Lock-free arena-backed skip list memtable for LSM-tree storage engines"
 license = "MIT"
-repository = "https://github.com/anomalyco/fastskip"
+repository = "https://github.com/themankindproject/fastskip"
+documentation = "https://docs.rs/fastskip"
+homepage = "https://github.com/themankindproject/fastskip"
+readme = "README.md"
 rust-version = "1.66"
 keywords = ["skiplist", "lock-free", "memtable", "lsm", "concurrent"]
 categories = ["concurrency", "data-structures", "memory-management"]
+exclude = [".github/", ".gitignore", "USAGE.md"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
