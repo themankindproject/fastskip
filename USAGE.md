@@ -272,6 +272,19 @@ let (value, is_new) = sl.get_or_insert(b"key", b"default");
 | `is_empty` | `fn is_empty(&self) -> bool` | Returns true if no live entries |
 | `is_sealed` | `fn is_sealed(&self) -> bool` | Returns true if sealed |
 | `memory_usage` | `fn memory_usage(&self) -> usize` | Total arena bytes allocated |
+| `memory_reserved` | `fn memory_reserved(&self) -> usize` | Total arena bytes reserved |
+| `memory_utilization` | `fn memory_utilization(&self) -> f64` | Utilization (0.0 to 1.0) |
+| `memory_idle` | `fn memory_idle(&self) -> usize` | Reserved but unused bytes |
+
+```rust
+let sl = ConcurrentSkipList::new();
+sl.insert(b"key", b"value");
+
+println!("allocated: {} bytes", sl.memory_usage());
+println!("reserved: {} bytes", sl.memory_reserved());
+println!("utilization: {:.1}%", sl.memory_utilization() * 100.0);
+println!("idle: {} bytes", sl.memory_idle());
+```
 
 #### Lifecycle
 
@@ -296,7 +309,10 @@ A sealed (read-only) memtable created by `seal()`. Used for flushing to SSTable.
 | `cursor_at` | `fn cursor_at(&self, target: &[u8]) -> Option<Cursor<'_>>` | Cursor at target |
 | `len` | `fn len(&self) -> usize` | Live entry count |
 | `is_empty` | `fn is_empty(&self) -> bool` | Returns true if empty |
-| `memory_usage` | `fn memory_usage(&self) -> usize` | Arena bytes |
+| `memory_usage` | `fn memory_usage(&self) -> usize` | Arena bytes allocated |
+| `memory_reserved` | `fn memory_reserved(&self) -> usize` | Arena bytes reserved |
+| `memory_utilization` | `fn memory_utilization(&self) -> f64` | Utilization (0.0 to 1.0) |
+| `memory_idle` | `fn memory_idle(&self) -> usize` | Reserved but unused |
 | `get` | `fn get(&self, key: &[u8]) -> Option<(&[u8], bool)>` | Point lookup |
 | `get_live` | `fn get_live(&self, key: &[u8]) -> Option<&[u8]>` | Point lookup (live only) |
 
