@@ -1,3 +1,5 @@
+#![cfg(not(miri))] // Thread spawning is extremely slow under Miri
+
 use std::sync::Arc;
 use std::thread;
 
