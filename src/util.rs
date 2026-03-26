@@ -18,19 +18,22 @@
 #[inline]
 pub(crate) fn compare_keys(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
     if a.len() >= 8 && b.len() >= 8 {
-        let prefix_a = u64::from_ne_bytes(a[..8].try_into().unwrap());
-        let prefix_b = u64::from_ne_bytes(b[..8].try_into().unwrap());
+        // Read the first 8 bytes of each key as a big-endian u64.
+        // On x86_64 this compiles to a single `movbe` or `mov + bswap`.
+        let prefix_a = u64::from_be_bytes(a[..8].try_into().unwrap());
+        let prefix_b = u64::from_be_bytes(b[..8].try_into().unwrap());
         if prefix_a != prefix_b {
-            // Swap bytes in-place for big-endian comparison without
-            // depending on target endanness.
-            return prefix_a.swap_bytes().cmp(&prefix_b.swap_bytes());
+            return prefix_a.cmp(&prefix_b);
         }
-    } else if a.len() >= 4 && b.len() >= 4 {
-        let pa = u32::from_ne_bytes(a[..4].try_into().unwrap());
-        let pb = u32::from_ne_bytes(b[..4].try_into().unwrap());
-        if pa != pb {
-            return pa.swap_bytes().cmp(&pb.swap_bytes());
+        // Prefixes match; try a 4-byte fallback at offset 8.
+        if a.len() >= 12 && b.len() >= 12 {
+            let lo_a = u32::from_be_bytes(a[8..12].try_into().unwrap());
+            let lo_b = u32::from_be_bytes(b[8..12].try_into().unwrap());
+            if lo_a != lo_b {
+                return lo_a.cmp(&lo_b);
+            }
         }
+        // Fall through to byte-by-byte.
     }
     a.cmp(b)
 }

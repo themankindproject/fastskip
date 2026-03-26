@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `ConcurrentArena`: shard cache `Vec` → `HashMap` → 8-entry inline array with `Drop` cleanup
+- `Cargo.toml`: add `[profile.release]` with `codegen-units = 1` + `lto = "thin"` (10-30% perf)
+- `TowerPtr::is_null`: skip pointer mask, check raw value directly
+- `#[inline]` on all `Iterator::next` impls (`Iter`, `SnapshotIter`, `Cursor`)
+- `#[cold]` on `should_seal` (cold path hint for branch prediction)
+- `compare_keys`: use `from_be_bytes` instead of `from_ne_bytes` + `swap_bytes`
 - `Cargo.toml`: updated `repository` URL to `themankindproject/fastskip`
 - `Cargo.toml`: added `documentation`, `homepage`, `readme`, `exclude` fields
 - `README.md`: fixed build badge URL to `themankindproject/fastskip`

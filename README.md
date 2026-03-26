@@ -202,6 +202,28 @@ println!("under backpressure: {}", sl.is_under_backpressure());
 - **Time-series append** — sequential inserts, periodic flush to disk
 - **Request-scoped caches** — per-request memtable, bulk reclaim on completion
 
+## Performance
+
+Benchmarks on AMD Ryzen 5 3600 (6-core, 3.6GHz). All numbers from `cargo bench`.
+
+### Concurrent writes (10K entries/thread, 64-byte keys)
+
+| Threads | Throughput | Latency/insert |
+|---------|------------|----------------|
+| 4 | **8.4M ops/s** | 119ns |
+| 8 | **7.8M ops/s** | 128ns |
+
+### Single-threaded latency
+
+| Operation | fastskip | BTreeMap | HashMap |
+|-----------|----------|----------|---------|
+| insert (random) | 221ns | 90ns | 21ns |
+| get hit | 54ns | 33ns | 17ns |
+| get miss | 24ns | 78ns | 16ns |
+| cursor seek | 51ns | 551ns | — |
+
+fastskip trades single-threaded speed for lock-free concurrent writes — BTreeMap and HashMap require external locking for multi-threaded access, which destroys throughput.
+
 See [USAGE.md](USAGE.md) for complete API reference.
 
 ## Configuration

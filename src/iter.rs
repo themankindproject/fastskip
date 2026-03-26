@@ -156,6 +156,7 @@ impl<'a> Iterator for SnapshotIter<'a> {
     /// isolation. Tombstone entries are included in the output — the
     /// caller decides how to handle them (e.g., writing tombstone
     /// markers to SSTables).
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             self.current = advance_node(self.current);
@@ -201,6 +202,7 @@ unsafe impl<'a> Sync for Iter<'a> where ConcurrentSkipList: Sync {}
 impl<'a> Iterator for Iter<'a> {
     type Item = Entry<'a>;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         self.current = advance_node(self.current);
 
@@ -406,6 +408,7 @@ impl<'a> Iterator for Cursor<'a> {
     /// Yield the current entry and advance to the next.
     ///
     /// Returns `None` when the cursor is invalid (at end or past all keys).
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if !self.valid() {
             return None;

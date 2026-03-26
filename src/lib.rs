@@ -482,6 +482,7 @@ impl ConcurrentSkipList {
     }
 
     /// Check if memtable should be sealed based on configured limits.
+    #[cold]
     fn should_seal(&self) -> bool {
         if self.sealed.load(Ordering::Acquire) {
             return true;

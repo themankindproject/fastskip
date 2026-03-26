@@ -38,11 +38,12 @@ pub(crate) struct ConcurrentArena {
 }
 
 // Thread-local storage for per-arena shard assignments.
-// We use a Vec of (arena_ptr, shard_index) to support multiple arenas
-// on the same thread (e.g., sequential test execution).
+// Small inline array avoids HashMap overhead on the hot path.
+// Most threads interact with 1-2 arenas, so 4 slots is plenty.
+const MAX_CACHED_ARENAS: usize = 8;
 thread_local! {
-    static SHARD_CACHE: std::cell::RefCell<Vec<(usize, isize)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    static SHARD_CACHE: std::cell::RefCell<[(usize, usize); MAX_CACHED_ARENAS]> =
+        std::cell::RefCell::new([(0, usize::MAX); MAX_CACHED_ARENAS]);
 }
 
 // SAFETY: Each shard is accessed by at most one writer thread at a time.
@@ -89,11 +90,26 @@ impl ConcurrentArena {
         let self_ptr = self as *const Self as usize;
         SHARD_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
-            // Look up cached shard for this arena on this thread
-            if let Some(&(_, idx)) = cache.iter().find(|&&(ptr, _)| ptr == self_ptr) {
-                return unsafe { &mut *self.shards[idx as usize].get() };
+            // Linear scan of 8 entries — faster than HashMap hash+probe for small N
+            for i in 0..MAX_CACHED_ARENAS {
+                if cache[i].0 == self_ptr {
+                    return unsafe { &mut *self.shards[cache[i].1].get() };
+                }
+                if cache[i].1 == usize::MAX {
+                    // Empty slot — claim a shard
+                    let assigned = self.shard_assign.fetch_add(1, Ordering::Relaxed);
+                    assert!(
+                        assigned < self.shards.len(),
+                        "more concurrent threads ({}) than arena shards ({}); \
+                         increase shard count via with_shards() or with_capacity_and_shards()",
+                        assigned + 1,
+                        self.shards.len()
+                    );
+                    cache[i] = (self_ptr, assigned);
+                    return unsafe { &mut *self.shards[assigned].get() };
+                }
             }
-            // First call on this thread for this arena — claim a unique shard
+            // Cache full — evict slot 0, claim new shard
             let assigned = self.shard_assign.fetch_add(1, Ordering::Relaxed);
             assert!(
                 assigned < self.shards.len(),
@@ -102,7 +118,7 @@ impl ConcurrentArena {
                 assigned + 1,
                 self.shards.len()
             );
-            cache.push((self_ptr, assigned as isize));
+            cache[0] = (self_ptr, assigned);
             unsafe { &mut *self.shards[assigned].get() }
         })
     }
@@ -139,7 +155,13 @@ impl ConcurrentArena {
         // Clear this thread's cached shard index for this arena.
         let self_ptr = self as *const Self as usize;
         SHARD_CACHE.with(|cache| {
-            cache.borrow_mut().retain(|&(ptr, _)| ptr != self_ptr);
+            let mut cache = cache.borrow_mut();
+            for i in 0..MAX_CACHED_ARENAS {
+                if cache[i].0 == self_ptr {
+                    cache[i] = (0, usize::MAX);
+                    break;
+                }
+            }
         });
     }
 
@@ -150,13 +172,31 @@ impl ConcurrentArena {
     /// Useful when a thread is repurposed after a memtable flush.
     #[allow(dead_code)]
     pub fn reset_local() {
-        SHARD_CACHE.with(|cache| cache.borrow_mut().clear());
+        SHARD_CACHE.with(|cache| {
+            *cache.borrow_mut() = [(0, usize::MAX); MAX_CACHED_ARENAS];
+        });
     }
 
     /// Returns the number of arena shards.
     #[allow(dead_code)]
     pub fn num_shards(&self) -> usize {
         self.shards.len()
+    }
+}
+
+impl Drop for ConcurrentArena {
+    fn drop(&mut self) {
+        // Clear this arena's shard cache entry to prevent accumulation
+        // when many arenas are created on the same thread (e.g., in benchmarks).
+        let self_ptr = self as *const Self as usize;
+        SHARD_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            for i in 0..MAX_CACHED_ARENAS {
+                if cache[i].0 == self_ptr {
+                    cache[i] = (0, usize::MAX);
+                }
+            }
+        });
     }
 }
 

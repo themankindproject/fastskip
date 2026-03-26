@@ -83,7 +83,7 @@ impl TowerPtr {
     /// Returns `true` if this is a null pointer.
     #[inline]
     pub fn is_null(self) -> bool {
-        self.ptr().is_null()
+        self.0 == 0
     }
 }
 
