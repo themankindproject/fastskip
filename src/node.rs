@@ -98,6 +98,13 @@ pub(crate) fn node_alloc_size(height: usize, key_len: usize, value_len: usize) -
     NODE_HEADER_SIZE + height * 8 + key_len + value_len
 }
 
+/// Compute allocation size using expected height (≈2) for quick estimation.
+#[allow(dead_code)]
+#[inline(always)]
+pub(crate) fn node_alloc_size_expected(key_len: usize, value_len: usize) -> usize {
+    NODE_HEADER_SIZE + 16 + key_len + value_len
+}
+
 /// Initialize a node at `ptr`. Node is NOT yet visible (no CAS has occurred).
 /// Header and key/value use plain stores. Tower uses relaxed atomic stores
 /// to avoid UB with concurrent `tower_load` (Acquire) after the node becomes
@@ -106,7 +113,7 @@ pub(crate) fn node_alloc_size(height: usize, key_len: usize, value_len: usize) -
 /// # Safety
 /// `ptr` must point to at least `node_alloc_size(height, key.len(), value.len())`
 /// bytes of valid, writable memory from the arena.
-#[inline]
+#[inline(always)]
 pub(crate) unsafe fn init_node(
     ptr: *mut u8,
     height: usize,
@@ -123,22 +130,19 @@ pub(crate) unsafe fn init_node(
     let value_offset = key_offset + key_len;
     let flags: u8 = if is_tombstone { TOMBSTONE_BIT } else { 0 };
 
-    // Header — plain stores (node not yet visible)
-    ptr.cast::<u32>().write(key_offset);
-    ptr.add(4).cast::<u32>().write(key_len);
-    ptr.add(8).cast::<u32>().write(value_offset);
-    ptr.add(12).cast::<u32>().write(value_len);
-    ptr.add(FLAGS_OFFSET).write(flags);
-    ptr.add(17).write(h);
-    // Offset 18-23: padding (6 bytes, zero)
-    std::ptr::write_bytes(ptr.add(18), 0, 6);
-    // Offset 24-31: seq as u64 (naturally aligned, plain store)
+    // Bulk write header as u64 chunks for fewer stores
+    // Layout: [key_offset:u32, key_len:u32] [value_offset:u32, value_len:u32] [flags:u8, h:u8, pad:6] [seq:u64]
+    let header0 = (key_len as u64) << 32 | key_offset as u64;
+    let header1 = (value_len as u64) << 32 | value_offset as u64;
+    let header2 = (h as u64) << 8 | flags as u64;
+
+    ptr.cast::<u64>().write(header0);
+    ptr.add(8).cast::<u64>().write(header1);
+    ptr.add(16).cast::<u64>().write(header2);
+    // Offset 24-31: seq as u64
     ptr.add(NODE_SEQ_OFFSET).cast::<u64>().write(seq);
 
-    // Tower — bulk zero all tower slots. The node is not yet visible,
-    // so no other thread can observe these locations. Using write_bytes
-    // is valid because the logical value 0u64 is identical to all-zero
-    // bits (TowerPtr::NULL == 0).
+    // Tower — bulk zero all tower slots
     std::ptr::write_bytes(ptr.add(NODE_HEADER_SIZE).cast::<u64>(), 0, height);
 
     // Key/value — plain stores (node not yet visible)

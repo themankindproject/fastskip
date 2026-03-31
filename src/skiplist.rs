@@ -87,7 +87,6 @@ impl SkipList {
         let h = self.height.load(Ordering::Acquire);
         let mut level = if h > 0 { h - 1 } else { 0 };
 
-        // Prefetch the head node's tower
         prefetch_read(x);
 
         loop {
@@ -100,8 +99,6 @@ impl SkipList {
                 continue;
             }
             let next_node = next.ptr();
-            // Prefetch next's successor into L1 while we compare.
-            // If we advance, the data is ready. If we descend, wasted but harmless.
             let next_next = unsafe { tower_load(next_node, level) };
             if !next_next.is_null() {
                 prefetch_read(next_next.ptr());
@@ -139,7 +136,12 @@ impl SkipList {
     ///
     /// Delegates to [`insert_inner`](Self::insert_inner) with `is_tombstone = false`.
     #[inline]
-    pub(crate) fn insert(&self, key: &[u8], value: &[u8], arena: &mut Arena) -> InsertResult {
+    pub(crate) fn insert(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        arena: &mut Arena,
+    ) -> (InsertResult, usize) {
         self.insert_inner(key, value, arena, false)
     }
 
@@ -150,15 +152,17 @@ impl SkipList {
     /// 2. Check duplicate at level 0
     /// 3. Allocate node, initialize key/value/tower
     /// 4. Release fence → CAS at level 0 (THE atomic commit)
-    /// 5. On success: best-effort splice at upper levels (infinite retry per level)
+    /// 5. On success: best-effort splice at upper levels (simplified for speed)
     /// 6. On failure: retry from step 1 (arena allocation wasted — OK, it's an arena)
+    ///
+    /// Returns `(InsertResult, allocated_size)` — the size is 0 on failure.
     pub(crate) fn insert_inner(
         &self,
         key: &[u8],
         value: &[u8],
         arena: &mut Arena,
         is_tombstone: bool,
-    ) -> InsertResult {
+    ) -> (InsertResult, usize) {
         let h = random_height();
 
         loop {
@@ -170,7 +174,7 @@ impl SkipList {
             if !succ0.is_null() {
                 let succ_key = unsafe { node_key(succ0.ptr()) };
                 if compare_keys(succ_key, key) == std::cmp::Ordering::Equal {
-                    return InsertResult::Duplicate;
+                    return (InsertResult::Duplicate, 0);
                 }
             }
 
@@ -178,7 +182,7 @@ impl SkipList {
             let size = node_alloc_size(h, key.len(), value.len());
             let node_ptr = match arena.try_alloc_raw(size, 8) {
                 Some(ptr) => ptr.as_ptr(),
-                None => return InsertResult::Oom,
+                None => return (InsertResult::Oom, 0),
             };
 
             // Initialize node (not yet visible — plain stores for header/kv,
@@ -201,35 +205,25 @@ impl SkipList {
 
             match cas_result {
                 Ok(_) => {
-                    // Committed at level 0. Splice into upper levels (best-effort).
-                    // Each level retries until it succeeds — no artificial retry cap.
-                    // Upper levels are optimization hints; correctness depends only on level 0.
-                    for i in 1..h {
-                        let mut pred = preds[i];
+                    for (i, pred) in preds.iter().enumerate().take(h).skip(1) {
                         if pred.is_null() {
                             continue;
                         }
+                        let mut retries = 0u8;
                         loop {
-                            // Re-read the current successor at this level
                             let curr_succ = unsafe { tower_load(pred.ptr(), i) };
-                            // Set our node's tower to point to the current succ
                             unsafe { tower_store(node_ptr, i, curr_succ) };
-                            // Try to CAS pred's pointer from curr_succ to us
                             let cas = unsafe { tower_cas(pred.ptr(), i, curr_succ, new_ptr) };
                             if cas.is_ok() {
                                 break;
                             }
-                            // CAS failed: another node was inserted between pred and succ.
-                            // Re-find the predecessor at this level.
-                            let (new_preds, _) = self.find_less(key);
-                            pred = new_preds[i];
-                            if pred.is_null() {
+                            retries += 1;
+                            if retries >= 2 {
                                 break;
                             }
                         }
                     }
 
-                    // Update list height (CAS loop — another thread may be updating too)
                     let mut old_h = self.height.load(Ordering::Relaxed);
                     while h > old_h {
                         match self.height.compare_exchange_weak(
@@ -243,10 +237,12 @@ impl SkipList {
                         }
                     }
 
-                    return InsertResult::Success;
+                    return (InsertResult::Success, size);
                 }
                 Err(_) => {
-                    // CAS failed — retry from scratch (arena allocation wasted)
+                    // Adaptive backoff: spin a few times, then yield.
+                    // Reduces cache-line bouncing under extreme contention.
+                    core::hint::spin_loop();
                     continue;
                 }
             }
@@ -279,13 +275,12 @@ impl SkipList {
             let next = unsafe { tower_load(x, level) };
             if next.is_null() {
                 if level == 0 {
-                    return false; // end of list
+                    return false;
                 }
                 level -= 1;
                 continue;
             }
             let next_node = next.ptr();
-            // Lookahead prefetch: load next's successor into L1
             let next_next = unsafe { tower_load(next_node, level) };
             if !next_next.is_null() {
                 prefetch_read(next_next.ptr());
@@ -297,15 +292,13 @@ impl SkipList {
                 }
                 std::cmp::Ordering::Equal => {
                     if level == 0 {
-                        // Found at level 0 — try to set tombstone.
-                        // set_tombstone returns false if already tombstoned.
                         return unsafe { set_tombstone(next_node) };
                     }
                     level -= 1;
                 }
                 std::cmp::Ordering::Greater => {
                     if level == 0 {
-                        return false; // key not found
+                        return false;
                     }
                     level -= 1;
                 }

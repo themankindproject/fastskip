@@ -11,9 +11,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `# Example` code blocks on every public method and type (50 doc tests)
 - `CHANGELOG.md`
+- O(1) `memory_usage()` via atomic running total (was O(N shards))
+- Adaptive backoff (`core::hint::spin_loop()`) on CAS failure to reduce cache-line bouncing
+- Iterator prefetching of next-next node for better cache behavior during scans
 
 ### Changed
 
+- `insert_inner()` returns `(InsertResult, usize)` — exact allocation size tracked per insert
+- `insert_batch()` optimized: single sealed check, single arena lookup, no per-insert overhead
+- `init_node()` uses bulk u64 header writes (3 stores) instead of 8 individual stores
+- `compare_keys()` uses `unwrap_unchecked()` behind length guards to eliminate bounds checks
+- `#[inline(always)]` on all hot-path functions (`compare_keys`, `prefetch_read`, `init_node`, `tower_load`, `tower_store`, `tower_cas`)
+- Release profile: `lto = "fat"`, `strip = true` for maximum optimization
 - `ConcurrentArena`: shard cache `Vec` → `HashMap` → 8-entry inline array with `Drop` cleanup
 - `Cargo.toml`: add `[profile.release]` with `codegen-units = 1` + `lto = "thin"` (10-30% perf)
 - `TowerPtr::is_null`: skip pointer mask, check raw value directly

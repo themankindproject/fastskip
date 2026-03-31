@@ -9,31 +9,34 @@
 /// Uses Masstree-inspired fast paths:
 /// 1. If both keys are >= 8 bytes, compare the first 8 bytes as a
 ///    big-endian `u64`. If they differ, return immediately.
-/// 2. If both keys are >= 4 bytes (but the 8-byte prefix matched),
-///    compare the first 4 bytes as a big-endian `u32`.
-/// 3. Fall back to standard byte-by-byte comparison via `a.cmp(b)`.
+/// 2. If both keys are >= 16 bytes and prefix matched, compare bytes 8..16.
+/// 3. If both keys are >= 12 bytes and prefix matched, compare bytes 8..12.
+/// 4. Fall back to standard byte-by-byte comparison via `a.cmp(b)`.
 ///
 /// The fast paths avoid the `memcmp`-style loop when prefixes differ,
 /// which is the common case for LSM-tree keys with sorted prefixes.
-#[inline]
+#[inline(always)]
 pub(crate) fn compare_keys(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
     if a.len() >= 8 && b.len() >= 8 {
-        // Read the first 8 bytes of each key as a big-endian u64.
-        // On x86_64 this compiles to a single `movbe` or `mov + bswap`.
-        let prefix_a = u64::from_be_bytes(a[..8].try_into().unwrap());
-        let prefix_b = u64::from_be_bytes(b[..8].try_into().unwrap());
+        // SAFETY: length checks ensure slices are at least 8/16/12 bytes
+        let prefix_a = unsafe { u64::from_be_bytes(a[..8].try_into().unwrap_unchecked()) };
+        let prefix_b = unsafe { u64::from_be_bytes(b[..8].try_into().unwrap_unchecked()) };
         if prefix_a != prefix_b {
             return prefix_a.cmp(&prefix_b);
         }
-        // Prefixes match; try a 4-byte fallback at offset 8.
-        if a.len() >= 12 && b.len() >= 12 {
-            let lo_a = u32::from_be_bytes(a[8..12].try_into().unwrap());
-            let lo_b = u32::from_be_bytes(b[8..12].try_into().unwrap());
+        if a.len() >= 16 && b.len() >= 16 {
+            let mid_a = unsafe { u64::from_be_bytes(a[8..16].try_into().unwrap_unchecked()) };
+            let mid_b = unsafe { u64::from_be_bytes(b[8..16].try_into().unwrap_unchecked()) };
+            if mid_a != mid_b {
+                return mid_a.cmp(&mid_b);
+            }
+        } else if a.len() >= 12 && b.len() >= 12 {
+            let lo_a = unsafe { u32::from_be_bytes(a[8..12].try_into().unwrap_unchecked()) };
+            let lo_b = unsafe { u32::from_be_bytes(b[8..12].try_into().unwrap_unchecked()) };
             if lo_a != lo_b {
                 return lo_a.cmp(&lo_b);
             }
         }
-        // Fall through to byte-by-byte.
     }
     a.cmp(b)
 }

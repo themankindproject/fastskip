@@ -59,7 +59,13 @@ fn advance_node(current: *const u8) -> *const u8 {
     if next.is_null() {
         std::ptr::null()
     } else {
-        next.ptr()
+        let node = next.ptr();
+        // Prefetch the next-next node while we return this one
+        let next_next = unsafe { tower_load(node, 0) };
+        if !next_next.is_null() {
+            prefetch_read(next_next.ptr());
+        }
+        node
     }
 }
 

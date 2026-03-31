@@ -289,17 +289,10 @@ impl std::error::Error for SealError {}
 pub struct ConcurrentSkipList {
     pub(crate) skiplist: SkipList,
     arena: ConcurrentArena,
-    /// Count of live (non-tombstone) entries. Incremented on insert,
-    /// decremented on delete.
     live_count: AtomicUsize,
-    /// Whether this memtable has been sealed (no more writes allowed).
     sealed: AtomicBool,
-    /// Maximum memory bytes before auto-seal. 0 = unlimited.
     max_memory_bytes: usize,
-    /// Maximum entries before auto-seal. 0 = unlimited.
     max_entries: usize,
-    /// Total insert attempts (including duplicates and failures).
-    /// Used for count-based sealing.
     total_inserts: AtomicUsize,
 }
 
@@ -404,6 +397,7 @@ impl ConcurrentSkipList {
         let local = arena.local();
         let head_size = node_alloc_size(MAX_HEIGHT, 0, 0);
         let head_ptr = local.alloc_raw(head_size, 8).as_ptr();
+        arena.record_alloc(head_size);
         unsafe {
             init_node(head_ptr, MAX_HEIGHT, b"", b"", false, 0);
         }
@@ -436,14 +430,18 @@ impl ConcurrentSkipList {
         if self.should_seal() {
             return false;
         }
-        self.total_inserts.fetch_add(1, Ordering::Relaxed);
         let arena = self.arena.local();
         match self.skiplist.insert(key, value, arena) {
-            InsertResult::Success => {
+            (InsertResult::Success, size) => {
+                self.total_inserts.fetch_add(1, Ordering::Relaxed);
                 self.live_count.fetch_add(1, Ordering::Relaxed);
+                self.arena.record_alloc(size);
                 true
             }
-            InsertResult::Duplicate | InsertResult::Oom => false,
+            (InsertResult::Duplicate | InsertResult::Oom, _) => {
+                self.total_inserts.fetch_add(1, Ordering::Relaxed);
+                false
+            }
         }
     }
 
@@ -469,15 +467,22 @@ impl ConcurrentSkipList {
         if self.should_seal() {
             return Err(InsertError::OutOfMemory);
         }
-        self.total_inserts.fetch_add(1, Ordering::Relaxed);
         let arena = self.arena.local();
         match self.skiplist.insert(key, value, arena) {
-            InsertResult::Success => {
+            (InsertResult::Success, size) => {
+                self.total_inserts.fetch_add(1, Ordering::Relaxed);
                 self.live_count.fetch_add(1, Ordering::Relaxed);
+                self.arena.record_alloc(size);
                 Ok(())
             }
-            InsertResult::Duplicate => Err(InsertError::DuplicateKey),
-            InsertResult::Oom => Err(InsertError::OutOfMemory),
+            (InsertResult::Duplicate, _) => {
+                self.total_inserts.fetch_add(1, Ordering::Relaxed);
+                Err(InsertError::DuplicateKey)
+            }
+            (InsertResult::Oom, _) => {
+                self.total_inserts.fetch_add(1, Ordering::Relaxed);
+                Err(InsertError::OutOfMemory)
+            }
         }
     }
 
@@ -516,13 +521,13 @@ impl ConcurrentSkipList {
     /// ```
     pub fn is_under_backpressure(&self) -> bool {
         if self.max_memory_bytes > 0 {
-            let threshold = (self.max_memory_bytes as f64 * 0.9) as usize;
+            let threshold = self.max_memory_bytes - self.max_memory_bytes / 10;
             if self.memory_usage() >= threshold {
                 return true;
             }
         }
         if self.max_entries > 0 {
-            let threshold = (self.max_entries as f64 * 0.9) as usize;
+            let threshold = self.max_entries - self.max_entries / 10;
             if self.len() >= threshold {
                 return true;
             }
@@ -591,12 +596,26 @@ impl ConcurrentSkipList {
     /// assert_eq!(sl.len(), 3);
     /// ```
     pub fn insert_batch(&self, entries: &[(&[u8], &[u8])]) -> Result<usize, BatchError> {
+        if self.sealed.load(Ordering::Acquire) {
+            return Err(BatchError::PartialFailure {
+                succeeded: 0,
+                failed: entries.len(),
+            });
+        }
         let mut succeeded = 0;
+        let arena = self.arena.local();
         for (key, value) in entries {
-            if self.insert(key, value) {
-                succeeded += 1;
+            match self.skiplist.insert(key, value, arena) {
+                (InsertResult::Success, size) => {
+                    succeeded += 1;
+                    self.live_count.fetch_add(1, Ordering::Relaxed);
+                    self.arena.record_alloc(size);
+                }
+                (InsertResult::Duplicate | InsertResult::Oom, _) => {}
             }
         }
+        self.total_inserts
+            .fetch_add(entries.len(), Ordering::Relaxed);
         let failed = entries.len() - succeeded;
         if failed > 0 {
             Err(BatchError::PartialFailure { succeeded, failed })
@@ -858,7 +877,7 @@ impl ConcurrentSkipList {
     /// assert!(sl.memory_usage() > before);
     /// ```
     pub fn memory_usage(&self) -> usize {
-        self.arena.stats().bytes_allocated
+        self.arena.bytes_allocated_fast()
     }
 
     /// Total arena bytes reserved across all shards.

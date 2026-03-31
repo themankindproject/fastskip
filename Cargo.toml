@@ -31,4 +31,7 @@ harness = false
 
 [profile.release]
 codegen-units = 1
-lto = "thin"
+lto = "fat"
+opt-level = 3
+debug = false
+strip = true

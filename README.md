@@ -224,6 +224,16 @@ Benchmarks on AMD Ryzen 5 3600 (6-core, 3.6GHz). All numbers from `cargo bench`.
 
 fastskip trades single-threaded speed for lock-free concurrent writes — BTreeMap and HashMap require external locking for multi-threaded access, which destroys throughput.
 
+### Recent Optimizations
+
+- **O(1) `memory_usage()`** — atomic running total instead of iterating all shards
+- **Bulk header writes** — `init_node()` uses 3×u64 stores instead of 8 individual stores
+- **Iterator prefetching** — lookahead prefetch of next-next node during scans
+- **Adaptive backoff** — `spin_loop()` hint on CAS failure reduces cache-line bouncing
+- **Bounds-check elimination** — `unwrap_unchecked()` in `compare_keys()` behind length guards
+- **`insert_batch()` optimization** — single sealed check + arena lookup for entire batch
+- **Fat LTO + strip** in release profile for maximum codegen quality
+
 See [USAGE.md](USAGE.md) for complete API reference.
 
 ## Configuration

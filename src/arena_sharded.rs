@@ -35,6 +35,9 @@ pub(crate) struct ConcurrentArena {
     /// new thread atomically claims the next shard index. Monotonically
     /// increments up to `shards.len()`, then panics if exceeded.
     shard_assign: AtomicUsize,
+    /// Running total of allocated bytes across all shards.
+    /// Updated on each allocation for O(1) memory_usage().
+    bytes_allocated: AtomicUsize,
 }
 
 // Thread-local storage for per-arena shard assignments.
@@ -43,7 +46,7 @@ pub(crate) struct ConcurrentArena {
 const MAX_CACHED_ARENAS: usize = 8;
 thread_local! {
     static SHARD_CACHE: std::cell::RefCell<[(usize, usize); MAX_CACHED_ARENAS]> =
-        std::cell::RefCell::new([(0, usize::MAX); MAX_CACHED_ARENAS]);
+        const { std::cell::RefCell::new([(0, usize::MAX); MAX_CACHED_ARENAS]) };
 }
 
 // SAFETY: Each shard is accessed by at most one writer thread at a time.
@@ -74,7 +77,21 @@ impl ConcurrentArena {
         ConcurrentArena {
             shards,
             shard_assign: AtomicUsize::new(0),
+            bytes_allocated: AtomicUsize::new(0),
         }
+    }
+
+    /// Record an allocation of `size` bytes in the running total.
+    /// Call this immediately after a successful arena allocation.
+    #[inline(always)]
+    pub fn record_alloc(&self, size: usize) {
+        self.bytes_allocated.fetch_add(size, Ordering::Relaxed);
+    }
+
+    /// O(1) bytes allocated across all shards (approximate under concurrent allocs).
+    #[inline(always)]
+    pub fn bytes_allocated_fast(&self) -> usize {
+        self.bytes_allocated.load(Ordering::Relaxed)
     }
 
     /// Get this thread's arena shard. First call assigns a unique shard via
@@ -152,6 +169,7 @@ impl ConcurrentArena {
         for shard in &mut self.shards {
             shard.get_mut().reset();
         }
+        self.bytes_allocated.store(0, Ordering::Relaxed);
         // Clear this thread's cached shard index for this arena.
         let self_ptr = self as *const Self as usize;
         SHARD_CACHE.with(|cache| {
