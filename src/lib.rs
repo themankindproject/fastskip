@@ -397,7 +397,6 @@ impl ConcurrentSkipList {
         let local = arena.local();
         let head_size = node_alloc_size(MAX_HEIGHT, 0, 0);
         let head_ptr = local.alloc_raw(head_size, 8).as_ptr();
-        arena.record_alloc(head_size);
         unsafe {
             init_node(head_ptr, MAX_HEIGHT, b"", b"", false, 0);
         }
@@ -435,7 +434,9 @@ impl ConcurrentSkipList {
             (InsertResult::Success, size) => {
                 self.total_inserts.fetch_add(1, Ordering::Relaxed);
                 self.live_count.fetch_add(1, Ordering::Relaxed);
-                self.arena.record_alloc(size);
+                if self.max_memory_bytes > 0 {
+                    self.arena.record_alloc(size);
+                }
                 true
             }
             (InsertResult::Duplicate | InsertResult::Oom, _) => {
@@ -472,7 +473,9 @@ impl ConcurrentSkipList {
             (InsertResult::Success, size) => {
                 self.total_inserts.fetch_add(1, Ordering::Relaxed);
                 self.live_count.fetch_add(1, Ordering::Relaxed);
-                self.arena.record_alloc(size);
+                if self.max_memory_bytes > 0 {
+                    self.arena.record_alloc(size);
+                }
                 Ok(())
             }
             (InsertResult::Duplicate, _) => {
@@ -602,6 +605,7 @@ impl ConcurrentSkipList {
                 failed: entries.len(),
             });
         }
+        let track_memory = self.max_memory_bytes > 0;
         let mut succeeded = 0;
         let arena = self.arena.local();
         for (key, value) in entries {
@@ -609,7 +613,9 @@ impl ConcurrentSkipList {
                 (InsertResult::Success, size) => {
                     succeeded += 1;
                     self.live_count.fetch_add(1, Ordering::Relaxed);
-                    self.arena.record_alloc(size);
+                    if track_memory {
+                        self.arena.record_alloc(size);
+                    }
                 }
                 (InsertResult::Duplicate | InsertResult::Oom, _) => {}
             }
@@ -877,7 +883,13 @@ impl ConcurrentSkipList {
     /// assert!(sl.memory_usage() > before);
     /// ```
     pub fn memory_usage(&self) -> usize {
-        self.arena.bytes_allocated_fast()
+        let fast = self.arena.bytes_allocated_fast();
+        if fast > 0 {
+            fast
+        } else {
+            // Fallback: iterate shards when no limits are configured
+            self.arena.stats().bytes_allocated
+        }
     }
 
     /// Total arena bytes reserved across all shards.

@@ -84,10 +84,8 @@ impl SkipList {
     #[inline]
     pub(crate) fn get(&self, key: &[u8]) -> Option<(&[u8], bool)> {
         let mut x = self.head;
-        let h = self.height.load(Ordering::Acquire);
+        let h = self.height.load(Ordering::Relaxed);
         let mut level = if h > 0 { h - 1 } else { 0 };
-
-        prefetch_read(x);
 
         loop {
             let next = unsafe { tower_load(x, level) };
@@ -99,10 +97,6 @@ impl SkipList {
                 continue;
             }
             let next_node = next.ptr();
-            let next_next = unsafe { tower_load(next_node, level) };
-            if !next_next.is_null() {
-                prefetch_read(next_next.ptr());
-            }
             let next_key = unsafe { node_key(next_node) };
             match compare_keys(next_key, key) {
                 std::cmp::Ordering::Less => {
@@ -266,10 +260,8 @@ impl SkipList {
     #[inline]
     pub(crate) fn delete(&self, key: &[u8]) -> bool {
         let mut x = self.head;
-        let h = self.height.load(Ordering::Acquire);
+        let h = self.height.load(Ordering::Relaxed);
         let mut level = if h > 0 { h - 1 } else { 0 };
-
-        prefetch_read(x);
 
         loop {
             let next = unsafe { tower_load(x, level) };
@@ -281,10 +273,6 @@ impl SkipList {
                 continue;
             }
             let next_node = next.ptr();
-            let next_next = unsafe { tower_load(next_node, level) };
-            if !next_next.is_null() {
-                prefetch_read(next_next.ptr());
-            }
             let next_key = unsafe { node_key(next_node) };
             match compare_keys(next_key, key) {
                 std::cmp::Ordering::Less => {
@@ -323,11 +311,8 @@ impl SkipList {
         let mut succs = [TowerPtr::NULL; MAX_HEIGHT];
 
         let mut x = self.head;
-        let h = self.height.load(Ordering::Acquire);
+        let h = self.height.load(Ordering::Relaxed);
         let mut level = if h > 0 { h - 1 } else { 0 };
-
-        // Prefetch head node
-        prefetch_read(x);
 
         loop {
             let next = unsafe { tower_load(x, level) };

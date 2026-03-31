@@ -16,7 +16,6 @@ use std::marker::PhantomData;
 use std::sync::atomic::Ordering;
 
 use crate::node::{is_tombstone, node_key, node_seq, node_value, tower_load};
-use crate::util::prefetch_read;
 use crate::ConcurrentSkipList;
 
 // ─── Entry ─────────────────────────────────────────────────────────────────────
@@ -59,13 +58,7 @@ fn advance_node(current: *const u8) -> *const u8 {
     if next.is_null() {
         std::ptr::null()
     } else {
-        let node = next.ptr();
-        // Prefetch the next-next node while we return this one
-        let next_next = unsafe { tower_load(node, 0) };
-        if !next_next.is_null() {
-            prefetch_read(next_next.ptr());
-        }
-        node
+        next.ptr()
     }
 }
 
@@ -289,18 +282,14 @@ impl<'a> Cursor<'a> {
     /// assert_eq!(cursor.entry().unwrap().key, b"c");
     /// ```
     pub fn seek(&mut self, skiplist: &'a ConcurrentSkipList, target: &[u8]) -> bool {
-        // Walk from head to find the predecessor of target
         let mut x = skiplist.skiplist.head;
-        let h = skiplist.skiplist.height.load(Ordering::Acquire);
+        let h = skiplist.skiplist.height.load(Ordering::Relaxed);
         let mut level = if h > 0 { h - 1 } else { 0 };
-
-        prefetch_read(x);
 
         loop {
             let next = unsafe { crate::node::tower_load(x, level) };
             if next.is_null() {
                 if level == 0 {
-                    // Reached end, target is past all keys
                     self.current = std::ptr::null();
                     return false;
                 }
@@ -308,11 +297,6 @@ impl<'a> Cursor<'a> {
                 continue;
             }
             let next_node = next.ptr();
-            // Lookahead prefetch
-            let next_next = unsafe { crate::node::tower_load(next_node, level) };
-            if !next_next.is_null() {
-                prefetch_read(next_next.ptr());
-            }
             let next_key = unsafe { node_key(next_node) };
             match crate::util::compare_keys(next_key, target) {
                 std::cmp::Ordering::Less => {
@@ -320,7 +304,6 @@ impl<'a> Cursor<'a> {
                 }
                 std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => {
                     if level == 0 {
-                        // Found: next_node is the first key >= target
                         self.current = next_node;
                         return true;
                     }
