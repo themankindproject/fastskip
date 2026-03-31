@@ -5,33 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.1] - 2026-03-31
+
+### Performance
+
+- Up to **27% faster** concurrent inserts (4 threads) and **20% faster** single-threaded sequential inserts
+- O(1) `memory_usage()` via atomic running total (was O(N shards))
+- Adaptive backoff (`core::hint::spin_loop()`) on CAS failure to reduce cache-line bouncing
+- `insert_batch()` optimized: single sealed check, single arena lookup, no per-insert overhead
+- `init_node()` uses bulk u64 header writes (3 stores) instead of 8 individual stores
+- `compare_keys()` uses `unwrap_unchecked()` behind length guards to eliminate bounds checks
+- Conditional `record_alloc` — atomic tracking only when memory limits are configured
+- Removed unnecessary prefetch from `get`, `delete`, `seek` paths (extra tower_load hurt cache-resident workloads)
+- Kept lookahead prefetch in `find_less` (beneficial for insert-heavy workloads with larger datasets)
+- `#[inline(always)]` on all hot-path functions
+- Release profile: `lto = "fat"`, `strip = true` for maximum optimization
+
+### Changed
+
+- `insert_inner()` returns `(InsertResult, usize)` — exact allocation size tracked per insert
+- `ConcurrentArena`: shard cache `Vec` → `HashMap` → 8-entry inline array with `Drop` cleanup
+- `TowerPtr::is_null`: skip pointer mask, check raw value directly
+- `#[inline]` on all `Iterator::next` impls (`Iter`, `SnapshotIter`, `Cursor`)
+- `#[cold]` on `should_seal` (cold path hint for branch prediction)
+- `compare_keys`: use `from_be_bytes` instead of `from_ne_bytes` + `swap_bytes`
 
 ### Added
 
 - `# Example` code blocks on every public method and type (50 doc tests)
 - `CHANGELOG.md`
-- O(1) `memory_usage()` via atomic running total (was O(N shards))
-- Adaptive backoff (`core::hint::spin_loop()`) on CAS failure to reduce cache-line bouncing
-- Iterator prefetching of next-next node for better cache behavior during scans
-
-### Changed
-
-- `insert_inner()` returns `(InsertResult, usize)` — exact allocation size tracked per insert
-- `insert_batch()` optimized: single sealed check, single arena lookup, no per-insert overhead
-- `init_node()` uses bulk u64 header writes (3 stores) instead of 8 individual stores
-- `compare_keys()` uses `unwrap_unchecked()` behind length guards to eliminate bounds checks
-- `#[inline(always)]` on all hot-path functions (`compare_keys`, `prefetch_read`, `init_node`, `tower_load`, `tower_store`, `tower_cas`)
-- Release profile: `lto = "fat"`, `strip = true` for maximum optimization
-- `ConcurrentArena`: shard cache `Vec` → `HashMap` → 8-entry inline array with `Drop` cleanup
-- `Cargo.toml`: add `[profile.release]` with `codegen-units = 1` + `lto = "thin"` (10-30% perf)
-- `TowerPtr::is_null`: skip pointer mask, check raw value directly
-- `#[inline]` on all `Iterator::next` impls (`Iter`, `SnapshotIter`, `Cursor`)
-- `#[cold]` on `should_seal` (cold path hint for branch prediction)
-- `compare_keys`: use `from_be_bytes` instead of `from_ne_bytes` + `swap_bytes`
-- `Cargo.toml`: updated `repository` URL to `themankindproject/fastskip`
-- `Cargo.toml`: added `documentation`, `homepage`, `readme`, `exclude` fields
-- `README.md`: fixed build badge URL to `themankindproject/fastskip`
 
 ### Removed
 

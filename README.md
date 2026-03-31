@@ -210,29 +210,34 @@ Benchmarks on AMD Ryzen 5 3600 (6-core, 3.6GHz). All numbers from `cargo bench`.
 
 | Threads | Throughput | Latency/insert |
 |---------|------------|----------------|
-| 4 | **8.4M ops/s** | 119ns |
+| 4 | **9.4M ops/s** | 106ns |
 | 8 | **7.8M ops/s** | 128ns |
 
 ### Single-threaded latency
 
 | Operation | fastskip | BTreeMap | HashMap |
 |-----------|----------|----------|---------|
-| insert (random) | 221ns | 90ns | 21ns |
-| get hit | 54ns | 33ns | 17ns |
-| get miss | 24ns | 78ns | 16ns |
-| cursor seek | 51ns | 551ns | — |
+| insert (seq, 10K) | 136µs | 1.37ms | 171µs |
+| insert (rand, 10K) | 2.2ms | 1.5ms | 212µs |
+| get hit | 80ns | 43ns | 20ns |
+| get miss | 38ns | 91ns | 16ns |
+| cursor seek (1K) | 36ns | 397ns | — |
+| cursor seek (10K) | 60ns | 5µs | — |
 
 fastskip trades single-threaded speed for lock-free concurrent writes — BTreeMap and HashMap require external locking for multi-threaded access, which destroys throughput.
 
-### Recent Optimizations
+### v0.1.1 Optimizations
 
-- **O(1) `memory_usage()`** — atomic running total instead of iterating all shards
-- **Bulk header writes** — `init_node()` uses 3×u64 stores instead of 8 individual stores
-- **Iterator prefetching** — lookahead prefetch of next-next node during scans
-- **Adaptive backoff** — `spin_loop()` hint on CAS failure reduces cache-line bouncing
-- **Bounds-check elimination** — `unwrap_unchecked()` in `compare_keys()` behind length guards
-- **`insert_batch()` optimization** — single sealed check + arena lookup for entire batch
-- **Fat LTO + strip** in release profile for maximum codegen quality
+- **27% faster concurrent inserts** (4 threads: 14.5ms → 10.6ms)
+- **20% faster sequential inserts** (10K: 1.7ms → 1.36ms)
+- **21% faster random inserts** (10K: 2.8ms → 2.2ms)
+- **33% faster cursor seek** (1K: 54ns → 36ns)
+- **19% faster seal+iterate** (1K: 155µs → 126µs)
+- O(1) `memory_usage()` — atomic running total instead of iterating all shards
+- Conditional allocation tracking — zero overhead when memory limits aren't configured
+- Bulk u64 header writes in `init_node()` (3 stores vs 8 individual stores)
+- Adaptive backoff on CAS failure reduces cache-line bouncing under contention
+- Fat LTO + strip in release profile for maximum codegen quality
 
 See [USAGE.md](USAGE.md) for complete API reference.
 

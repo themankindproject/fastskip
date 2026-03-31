@@ -198,7 +198,7 @@ checksum = "dbb6af25a0c0cc26bea589274c8ec868fdecd9a0f3dadbb1a63196df0e23f8cf"
 
 [[package]]
 name = "fastskip"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "criterion",
  "fastarena",

@@ -482,7 +482,17 @@ Arena memory is bulk-allocated in blocks and bulk-reclaimed when the memtable is
 
 ## Changelog
 
-### v0.1.0 (unreleased)
+### v0.1.1 (2026-03-31)
+
+- **Performance**: Up to 27% faster concurrent inserts, 20% faster sequential inserts
+- O(1) `memory_usage()` via atomic running total (was O(N shards))
+- Adaptive backoff on CAS failure to reduce cache-line bouncing
+- Optimized `insert_batch()`: single sealed check, single arena lookup
+- Bulk u64 header writes in `init_node()` (3 stores vs 8)
+- Conditional allocation tracking — zero overhead when memory limits aren't configured
+- Release profile: `lto = "fat"`, `strip = true`
+
+### v0.1.0 (2026-03-26)
 
 - Initial release
 - Lock-free skip list with per-thread arena shards
